@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "blackcode.omaclone",
+  "name": "OmaClone",
+  "version": "1.0.0",
+  "author": "BlackCode",
+  "license": "MIT",
+  "description": "OmaClone: paste a git link, pick a folder, clone. Works with GitHub, Forgejo, Codeberg, GitLab, Gitea, Bitbucket, SourceHut and any git server; cleans up links copied from the browser and shows live progress",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Clone",
+    "description": "Paste a git link and clone it into a folder you choose",
+    "category": "Developer Tools",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "defaultFolder": "",
+      "afterClone": "Nothing"
+    },
+    "schema": [
+      {
+        "key": "defaultFolder",
+        "type": "string",
+        "label": "Default folder",
+        "defaultValue": "",
+        "description": "Where repositories go when you have not picked a folder. Empty: the folder you used last, else ~/Projects if it exists, else your home folder."
+      },
+      {
+        "key": "afterClone",
+        "type": "enum",
+        "label": "After cloning",
+        "options": [
+          "Nothing",
+          "Open folder",
+          "Open in terminal",
+          "Open in editor"
+        ],
+        "defaultValue": "Nothing",
+        "description": "What to do when a clone finishes. The buttons for all three are always on the finished card."
+      }
+    ]
+  }
+}

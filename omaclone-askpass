@@ -1,0 +1,9 @@
+#!/bin/bash
+# The GIT_ASKPASS / SSH_ASKPASS helper of omaclone. When git asks for a username or a password, the answer comes from the environment
+# of that one clone (omaclone sets it from what you typed in the sign-in card). Nothing is stored or logged here.
+case "$1" in
+  Username* | username*) printf '%s\n' "${OMACLONE_USER-}" ;;
+  Password* | password*) printf '%s\n' "${OMACLONE_PASS-}" ;;
+  *assphrase*) printf '%s\n' "${OMACLONE_PASS-}" ;;     # ssh: Enter passphrase for key '...'
+  *) exit 1 ;;
+esac

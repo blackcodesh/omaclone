@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""omaclone: paste a git link, pick a folder, clone. The backend of the OmaClone bar plugin.
+
+  omaclone parse <text>                      clean up a pasted link: JSON with the clone URL, the repo name, the
+                                             provider and the branch a browser link points at
+  omaclone check <url> [<ref path>] [--credentials-from-stdin]
+                                             ask the server (git ls-remote): found, needs sign-in, not found...
+  omaclone clone <url> <folder> [options]    git clone with live progress as JSON lines
+        --name NAME        folder name inside <folder> (default: the repository name)
+        --branch REF       a branch or tag
+        --shallow          only the latest version (--depth 1)
+        --submodules       also fetch submodules
+        --trust-new-host   accept the SSH key of a server never connected to before (a changed key is still refused)
+        --credentials-from-stdin
+                           sign in: one JSON line on stdin, {"user": ..., "password": ..., "remember": false}. The
+                           password never goes on a command line, into the link or into the cloned repository
+  omaclone suggest <partial path>            folders matching what has been typed
+  omaclone ls <folder> [--hidden]            the folders inside a folder, for the folder browser
+  omaclone mkdir <parent> <name>             create a folder (one plain name) inside a folder
+  omaclone state [--default FOLDER]          recent folders, recent clones and the default folder
+  omaclone forget                            clear the history
+
+Works with any git server (GitHub, Forgejo, Codeberg, GitLab, Gitea, Bitbucket, SourceHut, self-hosted): it is plain
+`git clone` underneath. It never asks for a password in the background; a repository that needs one is reported so you
+can sign in (username and password or token) or use an SSH link or a terminal. Links that can run commands (ext::, fd::) are refused."""
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+HISTORY_MAX = 20
+FOLDERS_MAX = 8
+CHECK_TIMEOUT = int(os.environ.get("OMACLONE_CHECK_TIMEOUT", "20"))
+ALLOW_LOCAL = os.environ.get("OMACLONE_ALLOW_LOCAL") == "1"          # tests clone from a local folder
+
+# A path segment (after owner/repo) that starts a browser page, not the repository: the link is cut there.
+PAGE_MARKERS = {
+    "tree", "blob", "raw", "commits", "commit", "releases", "issues", "pull", "pulls", "pull-requests",
+    "merge_requests", "actions", "wiki", "wikis", "branches", "tags", "compare", "archive", "network", "graphs",
+    "pulse", "forks", "stargazers", "watchers", "security", "settings", "projects", "milestones", "labels",
+    "packages", "discussions", "src", "log", "refs", "blame", "history", "find", "activity", "insights", "-",
+    "downloads", "pipelines", "tree-commit", "contributors", "ci", "workflows", "deployments", "cards",
+}
+PROVIDERS = {
+    "github.com": "GitHub", "gist.github.com": "GitHub Gist", "gitlab.com": "GitLab", "codeberg.org": "Codeberg",
+    "bitbucket.org": "Bitbucket", "git.sr.ht": "SourceHut", "dev.azure.com": "Azure DevOps", "gitea.com": "Gitea",
+    "framagit.org": "Framagit", "salsa.debian.org": "Salsa", "invent.kde.org": "KDE Invent", "gitlab.gnome.org": "GNOME GitLab",
+    "git.kernel.org": "kernel.org", "sourceforge.net": "SourceForge", "git.savannah.gnu.org": "Savannah",
+}
+CREDENTIAL = re.compile(r"(?<=//)([^/@:\s]+):([^/@\s]+)@")
+SCP_LIKE = re.compile(r"^(?:(?P<user>[A-Za-z0-9._-]+)@)?(?P<host>[A-Za-z0-9.-]+):(?!//)(?P<path>[^\s]+)$")
+NAME_BAD = re.compile(r"[\x00-\x1f/\\]")
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def mask(url):
+    """The link with a password or token hidden, for the screen and the history."""
+    return CREDENTIAL.sub(lambda m: m.group(1) + ":***@", url)
+
+
+def repo_name(path):
+    last = path.rstrip("/").rsplit("/", 1)[-1]
+    if last.endswith(".git"):
+        last = last[:-4]
+    return last
+
+
+def safe_name(name):
+    """A folder name that is one plain path component."""
+    name = (name or "").strip()
+    if not name or name in (".", "..") or name.startswith("-") or NAME_BAD.search(name) or len(name) > 200:
+        return ""
+    return name
+
+
+def first_url(text):
+    """The link in whatever was pasted: a bare link, `git clone <link>`, a quoted link, a markdown link, a line from a README."""
+    text = (text or "").strip().strip("\"'`<>()[]")
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            text = line
+            break
+    tokens = text.split()
+    if tokens[:2] == ["git", "clone"] or tokens[:1] == ["clone"]:
+        rest = [t for t in tokens[2 if tokens[0] == "git" else 1:]]
+        skip = False
+        urls = []
+        for t in rest:
+            if skip:
+                skip = False
+                continue
+            if t in ("-b", "--branch", "--depth", "-o", "--origin", "--reference", "--config", "-c", "-j", "--jobs", "--template", "--separate-git-dir", "--filter"):
+                skip = True
+                continue
+            if t.startswith("-"):
+                continue
+            urls.append(t)
+        return (urls[0] if urls else "").strip("\"'`")
+    return tokens[0].strip("\"'`<>()[],;") if tokens else ""
+
+
+def parse(text):
+    raw = first_url(text)
+    if not raw:
+        return {"ok": False, "error": "empty", "message": "Paste a git link"}
+    if raw.startswith("-"):
+        return {"ok": False, "error": "unsafe", "message": "That is not a link"}
+    low = raw.lower()
+    if low.startswith(("ext::", "fd::")) or "::" in raw.split("//", 1)[0]:
+        return {"ok": False, "error": "unsafe", "message": "That kind of link can run commands, so it is refused"}
+    if ALLOW_LOCAL and (raw.startswith("file://") or raw.startswith("/")):
+        path = raw[7:] if raw.startswith("file://") else raw
+        return {"ok": True, "scheme": "file", "host": "", "path": path, "name": repo_name(path) or "repo", "cloneUrl": raw,
+                "display": raw, "provider": "local", "branch": "", "refPath": "", "kind": ""}
+    scheme_match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", raw)
+    if scheme_match:
+        scheme = scheme_match.group(1).lower()
+        if scheme not in ("http", "https", "ssh", "git", "git+ssh", "ssh+git"):
+            return {"ok": False, "error": "scheme", "message": f"“{scheme}://” links are not supported: use https, ssh or git"}
+        return parse_url(raw, scheme)
+    m = SCP_LIKE.match(raw)
+    if m and "." in m.group("host") or (m and m.group("user")):
+        user, host, path = m.group("user") or "git", m.group("host"), m.group("path")
+        name = repo_name(path)
+        if not name:
+            return {"ok": False, "error": "path", "message": "The link has no repository path"}
+        url = f"{user}@{host}:{path}"
+        return {"ok": True, "scheme": "ssh", "host": host, "port": 0, "user": user, "hasPassword": False, "path": path.strip("/"),
+                "name": safe_name(name) or "repo", "cloneUrl": url, "display": url, "provider": PROVIDERS.get(host.lower(), host),
+                "branch": "", "refPath": "", "kind": "", **alternates("ssh", host, user, path, url)}
+    # a link typed without its scheme: github.com/owner/repo
+    if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[^\s]+$", raw):
+        return parse_url("https://" + raw, "https")
+    return {"ok": False, "error": "format", "message": "That does not look like a git link (try https://host/owner/repo)"}
+
+
+def alternates(scheme, host, user, path, base):
+    """The two ways to reach one repository: {webUrl, webDisplay, sshUrl, sshPath, sshUser}. The https form never carries
+    a password the link did not have; sshUrl is None where SSH links are built differently (Azure DevOps) or not at all."""
+    clean = path.strip("/")
+    web = base if scheme in ("http", "https") else f"https://{host}/{urllib.parse.quote(clean, safe='/~@:+,._-')}"
+    ssh_user = user or "git"
+    azure = host.lower() == "dev.azure.com" or host.lower().endswith(".visualstudio.com")
+    ssh = None if azure or not re.fullmatch(r"[A-Za-z0-9._-]+", ssh_user) else f"{ssh_user}@{host}:{clean}"
+    return {"webUrl": web, "webDisplay": mask(web), "sshUrl": ssh, "sshUser": ssh_user,
+            "sshPath": urllib.parse.quote(clean, safe="/~@:+,._-")}
+
+
+def parse_url(raw, scheme):
+    try:
+        u = urllib.parse.urlsplit(raw)
+        host = u.hostname or ""
+    except ValueError:
+        return {"ok": False, "error": "format", "message": "That is not a valid link"}
+    if not host:
+        return {"ok": False, "error": "format", "message": "The link has no host"}
+    segs = [urllib.parse.unquote(s) for s in u.path.split("/") if s]
+    if host.lower() == "raw.githubusercontent.com":
+        return {"ok": False, "error": "raw", "message": "That is a link to a single file; paste the repository link"}
+    kind, ref_tail, cut_at, marker = "", [], len(segs), ""
+    azure = host.lower() == "dev.azure.com" or host.lower().endswith(".visualstudio.com")
+    if azure and "_git" in segs:
+        i = segs.index("_git")
+        cut_at = min(len(segs), i + 2)
+    else:
+        for i, s in enumerate(segs):
+            if i >= 2 and s in PAGE_MARKERS:
+                cut_at, marker = i, s
+                break
+    rest = segs[cut_at + 1:] if marker else []
+    repo_segs = segs[:cut_at]
+    if marker == "-" and rest:                         # GitLab: /-/tree/<ref>, /-/blob/<ref>
+        marker, rest = rest[0], rest[1:]
+    if marker in ("tree", "blob", "raw", "commits") and rest:
+        ref_tail = rest
+        if marker == "raw" and rest[:1] in (["branch"], ["tag"], ["commit"]):
+            kind, ref_tail = rest[0], rest[1:]
+    elif marker == "src" and rest:                     # Forgejo/Gitea: /src/branch/<b>, Bitbucket: /src/<ref>
+        if rest[0] in ("branch", "tag", "commit"):
+            kind, ref_tail = rest[0], rest[1:]
+        else:
+            ref_tail = rest
+    if marker in ("tree", "blob") and not kind:
+        kind = "branch"
+    if len(repo_segs) < 1 or (len(repo_segs) < 2 and not azure and host.lower() in PROVIDERS):
+        return {"ok": False, "error": "path", "message": "The link has no repository path (expected host/owner/repo)"}
+    if not repo_segs:
+        return {"ok": False, "error": "path", "message": "The link has no repository path"}
+    path = "/".join(repo_segs)
+    userinfo = ""
+    if u.username:
+        userinfo = urllib.parse.quote(u.username, safe="") + (":" + urllib.parse.quote(u.password, safe="") if u.password else "") + "@"
+    elif scheme in ("ssh", "git+ssh", "ssh+git"):
+        userinfo = ""
+    port = f":{u.port}" if u.port else ""
+    clone_scheme = {"git+ssh": "ssh", "ssh+git": "ssh"}.get(scheme, scheme)
+    base = f"{clone_scheme}://{userinfo}{host}{port}/{urllib.parse.quote(path, safe='/~@:+,._-')}"
+    name = safe_name(repo_name(path)) or "repo"
+    provider = PROVIDERS.get(host.lower()) or ("Forgejo / Gitea" if marker == "src" and kind in ("branch", "tag", "commit") else "GitLab" if "/-/" in u.path else host)
+    return {"ok": True, "scheme": clone_scheme, "host": host, "port": u.port or 0, "user": urllib.parse.unquote(u.username or ""),
+            "hasPassword": bool(u.password), "path": path, "name": name, "cloneUrl": base, "display": mask(base),
+            "provider": provider, "branch": ref_tail[0] if ref_tail and kind != "commit" else "", "refPath": "/".join(ref_tail) if kind != "commit" else "",
+            "kind": kind, **alternates(clone_scheme, host, urllib.parse.unquote(u.username or "") if clone_scheme in ("ssh", "git") else "", path, base)}
+
+
+ASKPASS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omaclone-askpass")
+
+
+def read_credentials():
+    """One JSON line on stdin: {"user", "password", "remember"}. None if it is missing or not usable."""
+    try:
+        line = sys.stdin.readline()
+        data = json.loads(line)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    user, password = data.get("user", ""), data.get("password", "")
+    if not isinstance(user, str) or not isinstance(password, str) or not (user or password):
+        return None
+    for v in (user, password):
+        if len(v) > 1000 or re.search(r"[\x00\r\n]", v):
+            return None
+    return {"user": user, "password": password, "remember": data.get("remember") is True}
+
+
+TRUST_NEW_HOST = False
+
+
+def git_env(creds=None, ssh=False):
+    env = dict(os.environ)
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "LC_ALL": "C", "LANG": "C", "GIT_ASKPASS": env.get("GIT_ASKPASS", "")})
+    env.pop("SSH_ASKPASS_REQUIRE", None)
+    if "GIT_SSH_COMMAND" not in env:
+        # accept-new only records the key of a server never seen before; a CHANGED key is still refused
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10" + (" -o StrictHostKeyChecking=accept-new" if TRUST_NEW_HOST else "")
+    if creds and ssh:
+        # a key with a passphrase: ssh asks the helper (no terminal, no agent), which answers from OMACLONE_PASS
+        env["SSH_ASKPASS"] = ASKPASS
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        if "GIT_SSH_COMMAND" not in os.environ:
+            env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10" + (" -o StrictHostKeyChecking=accept-new" if TRUST_NEW_HOST else "")
+    if creds:
+        if not os.access(ASKPASS, os.X_OK):             # a copy that lost its executable bit still works
+            try:
+                os.chmod(ASKPASS, os.stat(ASKPASS).st_mode | 0o755)
+            except OSError:
+                pass
+        # git asks the helper, which answers from these two variables of this one child process (not argv, not a file)
+        env["GIT_ASKPASS"] = ASKPASS
+        env["OMACLONE_USER"] = creds["user"]
+        env["OMACLONE_PASS"] = creds["password"]
+    return env
+
+
+def config_for(creds):
+    """What the typed login replaces: the stored credentials of the user's git helpers must not answer first."""
+    return SAFE_CONFIG + (["-c", "credential.helper="] if creds else [])
+
+
+SAFE_CONFIG = ["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"]
+
+
+def classify(stderr):
+    s = stderr.lower()
+    if any(k in s for k in ("could not read username", "could not read password", "terminal prompts disabled", "authentication failed",
+                            "permission denied (publickey", "http basic: access denied", "invalid username or password", "logon failed",
+                            "the requested url returned error: 401", "the requested url returned error: 403", "sign in", "host key verification failed")):
+        return "host-key" if "host key verification failed" in s else "auth"
+    if any(k in s for k in ("not found", "does not exist", "the requested url returned error: 404", "repository not found", "not a git repository", "unable to access")) and "could not resolve" not in s:
+        return "notfound"
+    if any(k in s for k in ("could not resolve host", "name or service not known", "temporary failure in name resolution", "network is unreachable",
+                            "connection timed out", "connection refused", "failed to connect", "timed out", "unable to connect", "ssl", "certificate")):
+        return "network"
+    return "other"
+
+
+HINTS = {
+    "auth-failed": "The server did not accept that login. Check the username and the password; many servers need an access token instead of your account password.",
+    "auth-ssh": "This repository needs your SSH key. If the key has a passphrase, type it below. Otherwise check that the key is added to your account on this server, or switch to HTTPS and sign in.",
+    "auth-ssh-failed": "The passphrase was not accepted, or the server does not know your key. Check the passphrase, and that the key is added to your account on this server.",
+    "auth": "This repository needs you to sign in. Enter your username and password or token below (an SSH link works too).",
+    "host-key": "SSH has not connected to this server before, so it cannot be sure it is the right one. If you trust it, press Trust this server.",
+    "notfound": "No repository at that link. Check the spelling; a private repository also shows up like this until you sign in.",
+    "network": "Could not reach the server. Check the connection and the address.",
+}
+
+
+def last_line(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for l in reversed(lines):
+        if not l.lower().startswith("hint:"):
+            return mask(l)
+    return ""
+
+
+def check(url, ref_tail="", creds=None):
+    p = parse(url)
+    if not p.get("ok"):
+        return {"status": "invalid", "message": p.get("message", "")}
+    cmd = ["git", *config_for(creds), "ls-remote", "--symref", "--", p["cloneUrl"], "HEAD", "refs/heads/*", "refs/tags/*"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=git_env(creds, p["scheme"] in ("ssh", "git+ssh", "ssh+git")), timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return {"status": "network", "message": "The server did not answer in time", "hint": HINTS["network"]}
+    except FileNotFoundError:
+        return {"status": "other", "message": "git is not installed"}
+    if r.returncode != 0:
+        kind = classify(r.stderr)
+        hint = (HINTS["auth-ssh-failed"] if p["scheme"] in ("ssh", "git+ssh", "ssh+git") else HINTS["auth-failed"]) if creds and kind == "auth" else HINTS["auth-ssh"] if kind == "auth" and p["scheme"] in ("ssh", "git") else HINTS.get(kind, "")
+        return {"status": kind, "message": last_line(r.stderr), "hint": hint, "signedIn": bool(creds)}
+    default, refs = "", set()
+    for line in r.stdout.splitlines():
+        if line.startswith("ref:"):
+            m = re.match(r"ref:\s+refs/heads/(\S+)\s+HEAD", line)
+            if m:
+                default = m.group(1)
+        else:
+            parts = line.split("\t")
+            if len(parts) == 2 and parts[1].startswith(("refs/heads/", "refs/tags/")) and not parts[1].endswith("^{}"):
+                refs.add(parts[1].split("/", 2)[2])
+    ref = ""
+    segs = [s for s in (ref_tail or "").split("/") if s]
+    for k in range(len(segs), 0, -1):
+        cand = "/".join(segs[:k])
+        if cand in refs:
+            ref = cand
+            break
+    result = {"status": "ok", "defaultBranch": default, "refs": len(refs), "ref": ref, "signedIn": bool(creds)}
+    if segs and not ref:
+        result["note"] = f"“{segs[0]}” is not a branch or tag of this repository, so the default branch is used"
+    return result
+
+
+def expand(path):
+    return os.path.abspath(os.path.expanduser(path or "~"))
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+def state_dir():
+    return os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omaclone")
+
+
+def history_file():
+    return os.path.join(state_dir(), "history.json")
+
+
+def load_history():
+    try:
+        with open(history_file()) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(items):
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=state_dir(), prefix=".h-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(items[:HISTORY_MAX], f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, history_file())
+
+
+def users_file():
+    return os.path.join(state_dir(), "users.json")
+
+
+def load_users():
+    try:
+        with open(users_file()) as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_user(host, user):
+    """The username (never the password) last used on a host, so the sign-in card can fill it in next time."""
+    if not host or not user:
+        return
+    users = load_users()
+    users[host] = user
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=state_dir(), prefix=".u-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(users, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, users_file())
+
+
+def ports_file():
+    return os.path.join(state_dir(), "ports.json")
+
+
+def load_ports():
+    try:
+        with open(ports_file()) as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, int) and 0 < v < 65536} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_port(host, port):
+    """The SSH port that worked on a host that does not use 22, so the panel can fill it in next time."""
+    if not host or not isinstance(port, int) or not 0 < port < 65536:
+        return
+    ports = load_ports()
+    ports[host] = port
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=state_dir(), prefix=".p-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(ports, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ports_file())
+
+
+def credential_helper_set():
+    try:
+        r = subprocess.run(["git", "config", "--get-all", "credential.helper"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and any(l.strip() for l in r.stdout.splitlines())
+
+
+def store_credentials(p, creds):
+    """Hand the login to the user's own git credential helper (libsecret, git-credential-manager...) so later pulls work."""
+    host = p["host"] + (f":{p['port']}" if p.get("port") else "")
+    text = f"protocol={p['scheme']}\nhost={host}\nusername={creds['user']}\npassword={creds['password']}\n\n"
+    try:
+        r = subprocess.run(["git", "credential", "approve"], input=text, capture_output=True, text=True, timeout=15, env=git_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def remember(url_display, folder, name, path):
+    items = [i for i in load_history() if i.get("path") != path]
+    items.insert(0, {"url": url_display, "folder": tilde(folder), "name": name, "path": tilde(path), "at": int(time.time())})
+    save_history(items)
+
+
+def state(default=""):
+    items = load_history()
+    folders, seen = [], set()
+    for i in items:
+        f = i.get("folder")
+        if f and f not in seen:
+            seen.add(f)
+            folders.append(f)
+    projects = os.path.expanduser("~/Projects")
+    chosen = tilde(expand(default)) if default else (folders[0] if folders else ("~/Projects" if os.path.isdir(projects) else "~"))
+    return {"defaultFolder": chosen, "folders": folders[:FOLDERS_MAX], "history": items[:8], "git": git_version(),
+            "users": load_users(), "ports": load_ports(), "credentialHelper": credential_helper_set()}
+
+
+def git_version():
+    try:
+        return subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip().replace("git version ", "")
+    except OSError:
+        return ""
+
+
+def suggest(partial):
+    text = partial or ""
+    full = expand(text) if text else os.path.expanduser("~")
+    typed_slash = text.endswith("/") or text in ("", "~")
+    parent, prefix = (full, "") if typed_slash or os.path.isdir(full) and text.endswith("/") else (os.path.dirname(full), os.path.basename(full))
+    exists = os.path.isdir(full)
+    res = {"path": tilde(full), "exists": exists, "writable": os.access(full if exists else parent, os.W_OK) if os.path.isdir(full if exists else parent) else False,
+           "items": []}
+    try:
+        names = sorted(n for n in os.listdir(parent) if os.path.isdir(os.path.join(parent, n)))
+    except OSError:
+        names = []
+    show_hidden = prefix.startswith(".")
+    items = [n for n in names if n.lower().startswith(prefix.lower()) and (show_hidden or not n.startswith(".")) and not (n == prefix and not typed_slash)]
+    res["items"] = [tilde(os.path.join(parent, n)) for n in items[:8]]
+    return res
+
+
+LS_MAX = 400
+
+
+def nearest_existing(path):
+    """The folder itself, or the closest folder above it that exists."""
+    cur = expand(path)
+    while not os.path.isdir(cur):
+        up = os.path.dirname(cur)
+        if up == cur:
+            return os.sep
+        cur = up
+    return cur
+
+
+def ls(path, hidden=False):
+    """The folders inside `path` (or inside its nearest existing parent), for the folder browser."""
+    home = os.path.expanduser("~")
+    cur = nearest_existing(path)
+    try:
+        entries = sorted((n for n in os.listdir(cur) if os.path.isdir(os.path.join(cur, n))), key=str.lower)
+        error = ""
+    except OSError as e:
+        entries, error = [], e.strerror or "cannot read this folder"
+    if not hidden:
+        entries = [n for n in entries if not n.startswith(".")]
+    more = len(entries) > LS_MAX
+    parent = os.path.dirname(cur)
+    return {"path": cur, "shown": tilde(cur), "parent": parent if parent != cur else "", "home": home,
+            "requested": expand(path), "exists": os.path.isdir(expand(path)), "writable": os.access(cur, os.W_OK),
+            "error": error, "more": more,
+            "items": [{"name": n, "path": os.path.join(cur, n)} for n in entries[:LS_MAX]]}
+
+
+def mkdir(parent, name):
+    """Create one folder inside an existing folder. The name is a single plain name: never a path."""
+    base = expand(parent)
+    clean = safe_name(name)
+    if not clean or clean.startswith("."):
+        return {"ok": False, "code": "name", "message": "A folder name must be a single plain name: no slashes, no leading dot or dash"}
+    if not os.path.isdir(base):
+        return {"ok": False, "code": "parent", "message": f"{tilde(base)} is not a folder"}
+    target = os.path.join(base, clean)
+    if os.path.lexists(target):
+        return {"ok": False, "code": "exists", "message": f"{clean} already exists here"}
+    try:
+        os.mkdir(target)
+    except OSError as e:
+        return {"ok": False, "code": "denied", "message": f"Cannot create {clean} in {tilde(base)}: {e.strerror}"}
+    return {"ok": True, "path": target, "shown": tilde(target), "name": clean}
+
+
+def destination(folder, name):
+    parent = expand(folder)
+    name = safe_name(name)
+    if not name:
+        return None, None, {"event": "error", "code": "name", "message": "The folder name must be a single plain name (no slashes)"}
+    return parent, os.path.join(parent, name), None
+
+
+PROGRESS = re.compile(r"^(?:remote:\s+)?(?P<phase>[A-Za-z][A-Za-z ]+?):\s+(?P<pct>\d+)%\s+\((?P<a>\d+)/(?P<b>\d+)\)(?:,\s*(?P<rest>.*?))?(?:,\s*done\.)?$")
+PHASE_SPAN = {"enumerating objects": (0, 5), "counting objects": (5, 10), "compressing objects": (10, 15), "receiving objects": (15, 80),
+              "resolving deltas": (80, 95), "updating files": (95, 100), "filtering content": (95, 100)}
+
+
+def clone(url, folder, name, branch="", shallow=False, submodules=False, creds=None):
+    p = parse(url)
+    if not p.get("ok"):
+        out({"event": "error", "code": p.get("error", "invalid"), "message": p.get("message", "")})
+        return 2
+    name = name or p["name"]
+    parent, dest, err = destination(folder, name)
+    if err:
+        out(err)
+        return 2
+    if os.path.lexists(dest) and (not os.path.isdir(dest) or os.listdir(dest)):
+        out({"event": "error", "code": "exists", "message": f"{tilde(dest)} already exists and is not empty. Pick another folder or name."})
+        return 2
+    made = []                                         # folders this clone creates, so a failed or cancelled clone can remove them
+    probe = parent
+    while probe and not os.path.lexists(probe) and os.path.dirname(probe) != probe:
+        made.append(probe)
+        probe = os.path.dirname(probe)
+    def drop_made():
+        for d in made:                                # deepest first; only ones that are empty, so nothing of yours goes
+            try:
+                os.rmdir(d)
+            except OSError:
+                break
+
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as e:
+        out({"event": "error", "code": "folder", "message": f"Cannot create {tilde(parent)}: {e.strerror}"})
+        return 2
+    if not os.access(parent, os.W_OK):
+        out({"event": "error", "code": "folder", "message": f"Cannot write to {tilde(parent)}"})
+        return 2
+    existed = os.path.isdir(dest)
+    cmd = ["git", *config_for(creds), "clone", "--progress"]
+    if branch:
+        cmd += ["--branch", branch]
+    if shallow:
+        cmd += ["--depth", "1", "--single-branch"]
+    if submodules:
+        cmd.append("--recurse-submodules")
+    cmd += ["--", p["cloneUrl"], dest]
+    out({"event": "start", "path": tilde(dest), "url": p["display"], "provider": p["provider"]})
+    started = time.time()
+    try:
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=git_env(creds, p["scheme"] in ("ssh", "git+ssh", "ssh+git")), start_new_session=True, bufsize=0)
+    except FileNotFoundError:
+        out({"event": "error", "code": "git", "message": "git is not installed"})
+        return 2
+    cancelled = {"v": False}
+
+    def stop(signum, frame):
+        cancelled["v"] = True
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    buf, tail, last_emit, last_pct = b"", [], 0.0, -1
+    while True:
+        chunk = proc.stderr.read(4096)
+        if not chunk:
+            break
+        buf += chunk
+        parts = re.split(rb"[\r\n]", buf)
+        buf = parts.pop()
+        for raw in parts:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            tail.append(line)
+            tail = tail[-12:]
+            m = PROGRESS.match(line)
+            if m:
+                phase = m.group("phase").strip()
+                lo, hi = PHASE_SPAN.get(phase.lower(), (0, 0))
+                overall = lo + (hi - lo) * int(m.group("pct")) / 100 if hi else None
+                now = time.time()
+                if overall is not None and (now - last_emit > 0.08 or int(m.group("pct")) == 100):
+                    last_emit = now
+                    out({"event": "progress", "phase": phase, "percent": round(overall, 1), "detail": "" if (m.group("rest") or "").strip() in ("done.", "done") else (m.group("rest") or "").strip()})
+            elif line.startswith("Cloning into"):
+                out({"event": "progress", "phase": "Connecting", "percent": 0, "detail": ""})
+    code = proc.wait()
+    if cancelled["v"]:
+        if not existed and os.path.isdir(dest) and not os.path.islink(dest) and os.path.realpath(dest).startswith(os.path.realpath(parent) + os.sep):
+            shutil.rmtree(dest, ignore_errors=True)
+        drop_made()
+        out({"event": "cancelled"})
+        return 130
+    if code != 0:
+        text = "\n".join(tail)
+        kind = classify(text)
+        hint = (HINTS["auth-ssh-failed"] if p["scheme"] in ("ssh", "git+ssh", "ssh+git") else HINTS["auth-failed"]) if creds and kind == "auth" else HINTS["auth-ssh"] if kind == "auth" and p["scheme"] in ("ssh", "git") else HINTS.get(kind, "")
+        drop_made()
+        out({"event": "error", "code": kind, "message": last_line(text) or "git clone failed", "hint": hint, "signedIn": bool(creds)})
+        return 1
+    head = subprocess.run(["git", "-C", dest, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+    sha = subprocess.run(["git", "-C", dest, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    try:
+        remember(p["display"], parent, name, dest)
+    except OSError:
+        pass
+    if p.get("scheme") == "ssh" and p.get("port"):
+        try:
+            remember_port(p["host"], p["port"])
+        except OSError:
+            pass
+    stored = False
+    if creds:
+        try:
+            if p["scheme"] in ("http", "https"):
+                remember_user(p["host"], creds["user"])
+            if creds["remember"] and p["scheme"] in ("http", "https") and credential_helper_set():
+                stored = store_credentials(p, creds)
+        except OSError:
+            pass
+    out({"event": "done", "path": dest, "shown": tilde(dest), "branch": head, "commit": sha, "seconds": round(time.time() - started, 1),
+         "signedIn": bool(creds), "remembered": stored})
+    return 0
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, rest = args[0], args[1:]
+    if "--trust-new-host" in rest:
+        # the user chose to trust a server they have not connected to before (what answering "yes" in a terminal does)
+        rest = [a for a in rest if a != "--trust-new-host"]
+        global TRUST_NEW_HOST
+        TRUST_NEW_HOST = True
+    if cmd == "parse":
+        out(parse(" ".join(rest)))
+    elif cmd == "check":
+        use_stdin = "--credentials-from-stdin" in rest
+        pos = [a for a in rest if a != "--credentials-from-stdin"]
+        creds = read_credentials() if use_stdin else None
+        if use_stdin and creds is None:
+            out({"status": "other", "message": "The login was not understood"})
+            return 2
+        out(check(pos[0] if pos else "", pos[1] if len(pos) > 1 else "", creds))
+    elif cmd == "suggest":
+        out(suggest(rest[0] if rest else ""))
+    elif cmd == "ls":
+        out(ls(rest[0] if rest and not rest[0].startswith("--") else "~", "--hidden" in rest))
+    elif cmd == "mkdir":
+        if len(rest) < 2:
+            out({"ok": False, "code": "usage", "message": "usage: omaclone mkdir <parent> <name>"})
+            return 2
+        res = mkdir(rest[0], rest[1])
+        out(res)
+        return 0 if res["ok"] else 1
+    elif cmd == "state":
+        default = rest[rest.index("--default") + 1] if "--default" in rest and rest.index("--default") + 1 < len(rest) else ""
+        out(state(default))
+    elif cmd == "forget":
+        try:
+            os.unlink(history_file())
+        except OSError:
+            pass
+        out({"ok": True})
+    elif cmd == "clone":
+        if len(rest) < 2:
+            out({"event": "error", "code": "usage", "message": "usage: omaclone clone <url> <folder> [--name N] [--branch B] [--shallow] [--submodules]"})
+            return 2
+        opts = {"name": "", "branch": "", "shallow": False, "submodules": False, "creds": None}
+        if "--credentials-from-stdin" in rest:
+            rest = [a for a in rest if a != "--credentials-from-stdin"]
+            opts["creds"] = read_credentials()
+            if opts["creds"] is None:
+                out({"event": "error", "code": "usage", "message": "The login was not understood"})
+                return 2
+        i = 2
+        while i < len(rest):
+            a = rest[i]
+            if a in ("--name", "--branch") and i + 1 < len(rest):
+                opts[a[2:]] = rest[i + 1]
+                i += 2
+            elif a == "--shallow":
+                opts["shallow"] = True
+                i += 1
+            elif a == "--submodules":
+                opts["submodules"] = True
+                i += 1
+            else:
+                out({"event": "error", "code": "usage", "message": f"unknown option {a}"})
+                return 2
+        return clone(rest[0], rest[1], **opts)
+    else:
+        out({"ok": False, "error": "usage", "message": f"unknown command {cmd!r}; try omaclone --help"})
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
