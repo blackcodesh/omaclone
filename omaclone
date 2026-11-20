@@ -110,8 +110,56 @@ def first_url(text):
     return tokens[0].strip("\"'`<>()[],;") if tokens else ""
 
 
+TOKENISH = re.compile(r"[A-Za-z0-9_.-]{20,}")
+
+
+def split_userinfo(raw):
+    """The one place a password or token is taken out of a link. Returns (link without it, login or None, refused).
+    The login is {"user", "password"}, only for http(s): ssh never takes a password from a link. `refused` is True for a
+    link whose password has an unencoded / ? or # in it, which cannot be told apart from a path: it is not echoed."""
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)(.*)$", raw, re.S)
+    if not m:
+        return raw, None, False
+    head, rest = m.groups()
+    end = min([i for i in (rest.find(c) for c in "/?#") if i != -1] or [len(rest)])
+    authority, tail = rest[:end], rest[end:]
+    at = authority.rfind("@")                       # the userinfo ends at the LAST @, so a password may contain one
+    if at < 0:
+        if "@" in tail and ":" in authority and not authority.rsplit(":", 1)[1].isdigit():
+            return "", None, True
+        return raw, None, False
+    userinfo, hostport = authority[:at], authority[at + 1:]
+    user, sep, password = userinfo.partition(":")
+    try:
+        user, password = urllib.parse.unquote(user), urllib.parse.unquote(password)
+    except ValueError:
+        pass
+    keep, login = user, None
+    if head[:-3].lower() in ("http", "https"):
+        if sep and password:
+            login = {"user": user, "password": password}
+        elif not sep and TOKENISH.fullmatch(user):          # a bare token in the user place
+            login, keep = {"user": user, "password": user}, ""
+    return head + (urllib.parse.quote(keep, safe="") + "@" if keep else "") + hostport + tail, login, False
+
+
 def parse(text):
+    """Read a pasted link. A password or token in it is returned only as `login` (for the panel's sign-in card); the link
+    (`cloneUrl`, `display`, `cleanText`) never has it, so it cannot reach a screen, a command line or a git config."""
     raw = first_url(text)
+    clean_raw, login, refused = split_userinfo(raw) if raw else (raw, None, False)
+    if refused:
+        return {"ok": False, "error": "secret", "wipe": True,
+                "message": "A password in a link must have / ? # @ written as %2F %3F %23 %40. Use the sign-in card instead."}
+    result = parse_link(clean_raw)
+    if clean_raw != raw:
+        result["cleanText"] = (text or "").replace(raw, clean_raw, 1) if raw in (text or "") else clean_raw
+    if login and result.get("ok"):
+        result["login"], result["hasPassword"] = login, True
+    return result
+
+
+def parse_link(raw):
     if not raw:
         return {"ok": False, "error": "empty", "message": "Paste a git link"}
     if raw.startswith("-"):
@@ -199,8 +247,8 @@ def parse_url(raw, scheme):
         return {"ok": False, "error": "path", "message": "The link has no repository path"}
     path = "/".join(repo_segs)
     userinfo = ""
-    if u.username:
-        userinfo = urllib.parse.quote(urllib.parse.unquote(u.username), safe="") + (":" + urllib.parse.quote(urllib.parse.unquote(u.password), safe="") if u.password else "") + "@"
+    if u.username:                                   # the link has already been cleaned: only a username can be left
+        userinfo = urllib.parse.quote(urllib.parse.unquote(u.username), safe="") + "@"
     elif scheme in ("ssh", "git+ssh", "ssh+git"):
         userinfo = ""
     port = f":{u.port}" if u.port else ""
@@ -209,12 +257,13 @@ def parse_url(raw, scheme):
     name = safe_name(repo_name(path)) or "repo"
     provider = PROVIDERS.get(host.lower()) or ("Forgejo / Gitea" if marker == "src" and kind in ("branch", "tag", "commit") else "GitLab" if "/-/" in u.path else host)
     return {"ok": True, "scheme": clone_scheme, "host": host, "port": u.port or 0, "user": urllib.parse.unquote(u.username or ""),
-            "hasPassword": bool(u.password), "path": path, "name": name, "cloneUrl": base, "display": mask(base),
+            "hasPassword": False, "path": path, "name": name, "cloneUrl": base, "display": mask(base),
             "provider": provider, "branch": ref_tail[0] if ref_tail and kind != "commit" else "", "refPath": "/".join(ref_tail) if kind != "commit" else "",
             "kind": kind, **alternates(clone_scheme, host, urllib.parse.unquote(u.username or "") if clone_scheme in ("ssh", "git") else "", path, base)}
 
 
 ASKPASS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omaclone-askpass")
+ASKPASS_SSH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omaclone-askpass-ssh")
 
 
 def read_credentials():
@@ -236,39 +285,53 @@ def read_credentials():
 
 
 TRUST_NEW_HOST = False
+SECRET_VARS = ("OMACLONE_USER", "OMACLONE_PASS", "OMACLONE_ORIGIN", "OMACLONE_KEY_PASS")
 
 
-def git_env(creds=None, ssh=False, host=""):
-    env = dict(os.environ)
+def git_env(creds=None, ssh=False, origin=""):
+    """The environment of one git process. A typed login goes to ONE kind of helper only:
+    https: GIT_ASKPASS (omaclone-askpass), which answers only for the exact origin (scheme://host[:port]);
+    ssh:   SSH_ASKPASS (omaclone-askpass-ssh), which answers only an SSH key passphrase prompt.
+    The two never see each other's secret, so a submodule over the other protocol gets nothing."""
+    env = {k: v for k, v in os.environ.items() if k not in SECRET_VARS}
     env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "LC_ALL": "C", "LANG": "C", "GIT_ASKPASS": env.get("GIT_ASKPASS", "")})
     env.pop("SSH_ASKPASS_REQUIRE", None)
     if "GIT_SSH_COMMAND" not in env:
         # accept-new only records the key of a server never seen before; a CHANGED key is still refused
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10" + (" -o StrictHostKeyChecking=accept-new" if TRUST_NEW_HOST else "")
-    if creds and ssh:
-        # a key with a passphrase: ssh asks the helper (no terminal, no agent), which answers from OMACLONE_PASS
-        env["SSH_ASKPASS"] = ASKPASS
-        env["SSH_ASKPASS_REQUIRE"] = "force"
-        if "GIT_SSH_COMMAND" not in os.environ:
-            env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10" + (" -o StrictHostKeyChecking=accept-new" if TRUST_NEW_HOST else "")
     if creds:
-        if not os.access(ASKPASS, os.X_OK):             # a copy that lost its executable bit still works
+        helper = ASKPASS_SSH if ssh else ASKPASS
+        if not os.access(helper, os.X_OK):              # a copy that lost its executable bit still works
             try:
-                os.chmod(ASKPASS, os.stat(ASKPASS).st_mode | 0o755)
+                os.chmod(helper, os.stat(helper).st_mode | 0o755)
             except OSError:
                 pass
-        # git asks the helper, which answers from these two variables of this one child process (not argv, not a file)
-        env["GIT_ASKPASS"] = ASKPASS
-        env["OMACLONE_HOST"] = host
-        env["OMACLONE_USER"] = creds["user"]
-        env["OMACLONE_PASS"] = creds["password"]
+        if ssh:
+            env["SSH_ASKPASS"] = ASKPASS_SSH
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["OMACLONE_KEY_PASS"] = creds["password"]
+            if "GIT_SSH_COMMAND" not in os.environ:
+                env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=no -o NumberOfPasswordPrompts=1 -o ConnectTimeout=10" + (" -o StrictHostKeyChecking=accept-new" if TRUST_NEW_HOST else "")
+        else:
+            env.pop("SSH_ASKPASS", None)
+            env["GIT_ASKPASS"] = ASKPASS
+            env["OMACLONE_ORIGIN"] = origin
+            env["OMACLONE_USER"] = creds["user"]
+            env["OMACLONE_PASS"] = creds["password"]
     return env
 
 
 def host_key(p):
-    """host[:port] as git prints it in a prompt, the only server a typed login may be given to."""
+    """scheme://host[:port] as git prints it in a prompt: the exact origin a typed login may be given to."""
     host = (p.get("host") or "").lower()
-    return host + (f":{p['port']}" if p.get("port") else "")
+    return f"{p.get('scheme', '')}://{host}" + (f":{p['port']}" if p.get("port") else "")
+
+
+def link_login(p, creds):
+    """The login to use: the one typed in the sign-in card, else the one that was in the link (https only)."""
+    if creds is None and p.get("login") and p.get("scheme") in ("http", "https"):
+        return {"user": p["login"]["user"], "password": p["login"]["password"], "remember": False}
+    return creds
 
 
 def config_for(creds):
@@ -316,6 +379,7 @@ def check(url, ref_tail="", creds=None):
     p = parse(url)
     if not p.get("ok"):
         return {"status": "invalid", "message": p.get("message", "")}
+    creds = link_login(p, creds)
     cmd = ["git", *config_for(creds), "ls-remote", "--symref", "--", p["cloneUrl"], "HEAD", "refs/heads/*", "refs/tags/*"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=git_env(creds, p["scheme"] in ("ssh", "git+ssh", "ssh+git"), host_key(p)), timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
@@ -572,6 +636,7 @@ def clone(url, folder, name, branch="", shallow=False, submodules=False, creds=N
     if not p.get("ok"):
         out({"event": "error", "code": p.get("error", "invalid"), "message": p.get("message", "")})
         return 2
+    creds = link_login(p, creds)
     name = name or p["name"]
     parent, dest, err = destination(folder, name)
     if err:
@@ -671,15 +736,6 @@ def clone(url, folder, name, branch="", shallow=False, submodules=False, creds=N
         remember(p["display"], parent, name, dest)
     except OSError:
         pass
-    if p.get("hasPassword") and p["scheme"] in ("http", "https"):
-        # a token that came in the link must not stay in the repository's remote: keep the link without the password
-        try:
-            u = urllib.parse.urlsplit(p["cloneUrl"])
-            netloc = (urllib.parse.quote(p["user"], safe="") + "@" if p.get("user") else "") + u.netloc.rsplit("@", 1)[-1]
-            subprocess.run(["git", "-C", dest, "remote", "set-url", "origin", urllib.parse.urlunsplit((u.scheme, netloc, u.path, "", ""))],
-                           capture_output=True, timeout=15)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            pass
     if p.get("scheme") == "ssh" and p.get("port"):
         try:
             remember_port(p["host"], p["port"])
@@ -711,7 +767,8 @@ def main(argv):
         global TRUST_NEW_HOST
         TRUST_NEW_HOST = True
     if cmd == "parse":
-        out(parse(" ".join(rest)))
+        # --stdin: the panel sends the link this way, so a password in it never appears in a process list
+        out(parse(sys.stdin.readline(4000) if "--stdin" in rest else " ".join(rest)))
     elif cmd == "check":
         use_stdin = "--credentials-from-stdin" in rest
         pos = [a for a in rest if a != "--credentials-from-stdin"]

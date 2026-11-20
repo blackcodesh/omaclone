@@ -142,13 +142,63 @@ class Parse(unittest.TestCase):
         self.ok("https://github.com/o/r/", cloneUrl="https://github.com/o/r")
         self.ok("HTTPS://GitHub.com/o/r", scheme="https", host="github.com")
 
-    def test_credentials_are_kept_for_cloning_but_hidden_for_display(self):
-        p = self.ok("https://user:s3cr3t-token@git.example.org/o/r.git", name="r")
-        self.assertIn("s3cr3t-token", p["cloneUrl"])
-        self.assertNotIn("s3cr3t-token", p["display"])
-        self.assertIn("user:***@", p["display"])
-        q = self.ok("https://oauth2:glpat-abc@gitlab.com/o/r")
-        self.assertNotIn("glpat-abc", q["display"])
+    def test_a_password_or_token_is_taken_out_of_the_link_in_every_form(self):
+        cases = {
+            "https://user:s3cr3t-token@git.example.org/o/r.git": ("user", "s3cr3t-token"),
+            "https://oauth2:glpat-abc@gitlab.com/o/r": ("oauth2", "glpat-abc"),
+            "https://u:p@ss@host.org/o/r": ("u", "p@ss"),                      # an unencoded @ in the password
+            "HTTPS://u:%40t%2Fok@host.org:8443/o/r": ("u", "@t/ok"),           # upper case scheme, encoded characters, a port
+            "http://u:tok@host.org/o/r/tree/main": ("u", "tok"),
+            "git clone -b dev https://u:tok@host.org/o/r": ("u", "tok"),
+            "https://:tok@host.org/o/r": ("", "tok"),
+            "https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/o/r": ("ghp_abcdefghijklmnopqrstuvwxyz0123", "ghp_abcdefghijklmnopqrstuvwxyz0123"),
+        }
+        for link, (user, secret) in cases.items():
+            p = M.parse(link)
+            self.assertTrue(p["ok"], link)
+            self.assertEqual(p["login"], {"user": user, "password": secret}, link)
+            for field in ("cloneUrl", "display", "cleanText", "webUrl", "webDisplay", "sshUrl"):
+                self.assertNotIn(secret, p.get(field) or "", (link, field))
+            self.assertTrue(p["hasPassword"])
+
+    def test_the_cleaned_text_keeps_the_rest_of_what_was_pasted(self):
+        p = M.parse("git clone -b dev https://u:tok@host.org/o/r")
+        self.assertEqual(p["cleanText"], "git clone -b dev https://u@host.org/o/r")
+        self.assertEqual(p["branch"], "")
+
+    def test_ssh_links_never_take_a_password_from_the_link(self):
+        p = M.parse("ssh://git:pw@host.org/o/r")
+        self.assertNotIn("login", p)
+        self.assertNotIn("pw", p["cloneUrl"] + p["display"] + p.get("cleanText", ""))
+
+    def test_a_password_that_cannot_be_told_from_a_path_is_refused_and_not_echoed(self):
+        for link in ("https://u:pa/ss@host.org/o/r", "https://u:p?ss@host.org/o/r", "https://u:p#ss@host.org/o/r"):
+            p = M.parse(link)
+            self.assertFalse(p["ok"], link)
+            self.assertTrue(p["wipe"], link)
+            self.assertNotIn("cleanText", p)
+
+    def test_normal_links_with_an_at_or_a_port_are_untouched(self):
+        for link in ("https://github.com/o/r@v1", "https://host.org:8443/o/r", "https://host.org/o/r?x=a@b"):
+            p = M.parse(link)
+            self.assertNotIn("login", p, link)
+            self.assertNotIn("cleanText", p, link)
+
+    def test_the_parse_command_answers_after_one_line_without_waiting_for_the_pipe_to_close(self):
+        # the panel keeps its end of the pipe open, so the script must not wait for end-of-input
+        p = subprocess.Popen([sys.executable, "-I", TOOL, "parse", "--stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        p.stdin.write("https://u:tok@host.org/o/r\n")
+        p.stdin.flush()
+        line = p.stdout.readline()                       # would hang here if it read until EOF
+        p.stdin.close()
+        p.wait(timeout=10)
+        self.assertEqual(json.loads(line)["login"]["password"], "tok")
+
+    def test_the_parse_command_can_read_the_link_from_stdin(self):
+        r = subprocess.run([sys.executable, "-I", TOOL, "parse", "--stdin"], input="https://u:tok@host.org/o/r\n", capture_output=True, text=True)
+        d = json.loads(r.stdout)
+        self.assertEqual(d["login"]["password"], "tok")
+        self.assertNotIn("tok", d["cloneUrl"])
 
     def test_dangerous_or_unsupported_links_are_refused(self):
         for text in ("ext::sh -c 'touch /tmp/pwn'", "ext::git-shell", "fd::17", "EXT::foo", "-oProxyCommand=evil", "--upload-pack=evil https://x/y",
@@ -681,7 +731,7 @@ class SignIn(Env):
 
     def test_the_helper_script_answers_only_from_the_environment(self):
         helper = os.path.join(ROOT, "omaclone-askpass")
-        env = dict(os.environ, OMACLONE_USER="u ser", OMACLONE_PASS="pw -n \\x", OMACLONE_HOST="h")
+        env = dict(os.environ, OMACLONE_USER="u ser", OMACLONE_PASS="pw -n \\x", OMACLONE_ORIGIN="https://h")
         def ask(prompt):
             return subprocess.run([helper, prompt], capture_output=True, text=True, env=env)
         self.assertEqual(ask("Username for 'https://h': ").stdout, "u ser\n")
@@ -689,21 +739,51 @@ class SignIn(Env):
         r = ask("Are you sure you want to continue connecting (yes/no)? ")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
+        r = ask("Enter passphrase for key '/home/x/.ssh/id': ")
+        self.assertNotEqual(r.returncode, 0)
 
-    def test_the_login_is_only_given_to_the_server_it_was_typed_for(self):
+    def test_the_login_is_only_given_to_the_exact_origin_it_was_typed_for(self):
         helper = os.path.join(ROOT, "omaclone-askpass")
-        env = dict(os.environ, OMACLONE_USER="alice", OMACLONE_PASS="PW", OMACLONE_HOST="git.example.org:3000")
+        env = dict(os.environ, OMACLONE_USER="alice", OMACLONE_PASS="PW", OMACLONE_ORIGIN="https://git.example.org:3000")
         def ask(p, e=env):
             return subprocess.run([helper, p], capture_output=True, text=True, env=e)
         self.assertEqual(ask("Password for 'https://alice@git.example.org:3000': ").stdout, "PW\n")
         self.assertEqual(ask("Password for 'https://GIT.Example.org:3000': ").stdout, "PW\n")
         for other in ("Password for 'https://alice@evil.example.net': ", "Password for 'https://git.example.org': ",
-                      "Username for 'https://git.example.org.evil.net:3000': ", "Password for 'https://x@git.example.org:3001': "):
+                      "Username for 'https://git.example.org.evil.net:3000': ", "Password for 'https://x@git.example.org:3001': ",
+                      "Password for 'http://git.example.org:3000': ",           # the same host over another scheme
+                      "Password for 'ssh://git.example.org:3000': ", "Password for 'git.example.org:3000': ", "Password for : "):
             r = ask(other)
             self.assertNotEqual(r.returncode, 0, other)
             self.assertEqual(r.stdout, "", other)
-        no_host = {k: v for k, v in env.items() if k != "OMACLONE_HOST"}
-        self.assertNotEqual(ask("Password for 'https://git.example.org:3000': ", no_host).returncode, 0)
+        no_origin = {k: v for k, v in env.items() if k != "OMACLONE_ORIGIN"}
+        self.assertNotEqual(ask("Password for 'https://git.example.org:3000': ", no_origin).returncode, 0)
+
+    def test_https_and_ssh_secrets_are_kept_apart(self):
+        http_env = M.git_env({"user": "alice", "password": "WEBPW", "remember": False}, ssh=False, origin="https://h")
+        self.assertEqual(http_env["GIT_ASKPASS"], M.ASKPASS)
+        self.assertNotIn("SSH_ASKPASS", http_env)
+        self.assertNotIn("OMACLONE_KEY_PASS", http_env)
+        ssh_env = M.git_env({"user": "", "password": "KEYPW", "remember": False}, ssh=True, origin="ssh://h")
+        self.assertEqual(ssh_env["SSH_ASKPASS"], M.ASKPASS_SSH)
+        self.assertEqual(ssh_env["OMACLONE_KEY_PASS"], "KEYPW")
+        for var in ("OMACLONE_PASS", "OMACLONE_USER", "OMACLONE_ORIGIN"):
+            self.assertNotIn(var, ssh_env, var)
+        self.assertNotEqual(ssh_env["GIT_ASKPASS"], M.ASKPASS)              # git's https flow cannot reach the passphrase
+        self.assertNotIn("KEYPW", "".join(v for k, v in ssh_env.items() if k != "OMACLONE_KEY_PASS"))
+        self.assertNotIn("WEBPW", "".join(v for k, v in http_env.items() if k not in ("OMACLONE_PASS",)))
+
+    def test_the_https_helper_never_answers_with_the_ssh_passphrase_and_the_reverse(self):
+        web, key = os.path.join(ROOT, "omaclone-askpass"), os.path.join(ROOT, "omaclone-askpass-ssh")
+        env = dict(os.environ, OMACLONE_KEY_PASS="KEYPW", OMACLONE_ORIGIN="https://h")
+        r = subprocess.run([web, "Password for 'https://h': "], capture_output=True, text=True, env=env)
+        self.assertEqual(r.stdout.replace("\n", ""), "")                    # no OMACLONE_PASS: nothing (and never the key's)
+        env = dict(os.environ, OMACLONE_PASS="WEBPW", OMACLONE_USER="u", OMACLONE_ORIGIN="https://h")
+        r = subprocess.run([key, "Enter passphrase for key '/k': "], capture_output=True, text=True, env=env)
+        self.assertNotIn("WEBPW", r.stdout)
+        r = subprocess.run([key, "Password for 'https://h': "], capture_output=True, text=True, env=dict(os.environ, OMACLONE_KEY_PASS="KEYPW"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
 
     def test_a_submodule_on_another_server_does_not_get_the_login(self):
         second = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GitHttp)
@@ -727,16 +807,40 @@ class SignIn(Env):
             second.shutdown()
             second.server_close()
 
-    def test_a_token_in_the_link_is_not_left_in_the_remote(self):
+    def shim_git(self):
+        """A git that logs its arguments, so a test can see what was ever put on a command line."""
+        shim = os.path.join(self.home, "bin")
+        os.makedirs(shim, exist_ok=True)
+        log = os.path.join(self.home, "argv.log")
+        real = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+        with open(os.path.join(shim, "git"), "w") as f:
+            f.write(f'#!/bin/bash\nprintf "%s\\n" "$@" >> "{log}"\nexec "{real}" "$@"\n')
+        os.chmod(os.path.join(shim, "git"), 0o755)
+        return dict(self.creds_env(), PATH=shim + os.pathsep + os.environ["PATH"]), log
+
+    def test_a_token_in_the_link_never_reaches_git_or_its_config(self):
+        env, log = self.shim_git()
         url = self.url.replace("http://", f"http://alice:{PASSWORD_URL}@")
-        r, ev = self.run_tool("clone", url, os.path.join(self.home, "c"), env=self.creds_env())
-        self.assertEqual(r.returncode, 0, ev)
+        r, ev = self.run_tool("clone", url, os.path.join(self.home, "c"), env=env)
+        self.assertEqual(r.returncode, 0, ev)                              # the login from the link still works...
+        with open(log) as f:
+            argv = f.read()
+        self.assertNotIn(PASSWORD, argv)                                   # ...but is never an argument of any git command
+        self.assertNotIn(PASSWORD_URL, argv)
         with open(os.path.join(self.home, "c", "proj", ".git", "config")) as f:
             config = f.read()
         self.assertNotIn(PASSWORD_URL, config)
         self.assertNotIn(PASSWORD, config)
         self.assertIn("alice@127.0.0.1", config)
         self.assertNotIn(PASSWORD_URL, r.stdout + r.stderr)
+
+    def test_checking_a_link_with_a_token_keeps_it_off_the_command_line_too(self):
+        env, log = self.shim_git()
+        url = self.url.replace("http://", f"http://alice:{PASSWORD_URL}@")
+        r, [c] = self.run_tool("check", url, env=env)
+        self.assertEqual(c["status"], "ok", c)
+        with open(log) as f:
+            self.assertNotIn(PASSWORD, f.read())
 
     def test_the_link_can_carry_the_username(self):
         p = M.parse(f"http://alice@127.0.0.1:1234/o/r.git")
@@ -850,8 +954,8 @@ class SshPassphrase(Env):
                     self.assertNotIn(PASSPHRASE, f.read())
 
     def test_the_helper_answers_passphrase_prompts_only(self):
-        helper = os.path.join(ROOT, "omaclone-askpass")
-        env = dict(os.environ, OMACLONE_PASS="s3cret phrase")
+        helper = os.path.join(ROOT, "omaclone-askpass-ssh")
+        env = dict(os.environ, OMACLONE_KEY_PASS="s3cret phrase")
         ok = subprocess.run([helper, "Enter passphrase for key '/home/u/.ssh/id_ed25519': "], capture_output=True, text=True, env=env)
         self.assertEqual(ok.stdout, "s3cret phrase\n")
         no = subprocess.run([helper, "Are you sure you want to continue connecting (yes/no)? "], capture_output=True, text=True, env=env)

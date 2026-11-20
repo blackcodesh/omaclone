@@ -8,6 +8,14 @@ Bitbucket, SourceHut and any other git server**, because underneath it is plain 
 
 **Compatibility:** works with Omarchy 4.5 (checked on 4.5.0-3: manifest validation, the plugin's own tests, a live run on a 4.5 bar, and real clones from GitHub and Codeberg).
 
+## What's new in 1.0.2
+
+Follow-up credential fixes from the marketplace review:
+
+- **One parser, secrets out first.** A password or token in a link (every form: `user:token@`, an `@` or encoded characters in the password, upper-case scheme, `git clone …` lines, a bare token) is taken out by the backend before anything is shown, passed to a process or written to git config. The panel sends links to the parser on stdin, never as an argument. A password that cannot be told from a path (an unencoded `/`, `?` or `#`) is refused and not echoed.
+- **Secrets are kept apart by protocol and exact origin.** An https login is given only to the exact origin it was typed for (scheme, host and port); an SSH key passphrase goes only to SSH's own passphrase prompt (`omaclone-askpass-ssh`) and never to git's https flow.
+- The remote of the cloned repository never contained the token to begin with (no rewrite step that could fail).
+
 ## What's new in 1.0.1
 
 Credential handling, after a review of 1.0.0:
@@ -133,10 +141,10 @@ The backend works on its own too: `omaclone parse <link>`, `omaclone check <link
 - **Passwords**: what you type in the Sign in card is sent to the script over a pipe, never on a command line, and git
   reads it through a tiny helper (`omaclone-askpass`) from the environment of that one clone. It is not put in the
   link, not written to the cloned repository's config, not in the history, and cleared from the popup when the clone
-  ends. Only the username (never the password) is remembered, per server. A password or token you put in a link is moved by the panel
-  into the sign-in card, so it travels the same private way, and the remote of the cloned repository is cleaned. (Only if
-  you run the `omaclone` script yourself with a token in the link is it passed to `git` as an argument, as `git clone`
-  does.) A login is given only to the server it was typed for, and an SSH key passphrase is kept apart from passwords.
+  ends. Only the username (never the password) is remembered, per server. A password or token you put in a link is taken out of it by the
+  backend before anything else sees the link (the panel sends links on stdin), and travels the same private way, so it is
+  never in the field, on a command line or in the repository's remote, even when you run `omaclone` yourself. A login is
+  given only to the exact origin it was typed for, and an SSH key passphrase is kept apart from passwords, with its own helper.
 - **History** (`~/.local/state/omaclone/history.json`, mode 0600) keeps the last 20 clones: hidden link, folder, time.
   `omaclone forget` clears it.
 - SSH uses `BatchMode`: it never waits for a password or a host-key question you cannot see. An unknown server is
@@ -174,7 +182,7 @@ password (right and wrong logins, awkward characters, no leaks of the password),
 | File | What it is |
 |------|------------|
 | `manifest.json`, `Panel.qml`, `icon.svg` | The bar button and popup |
-| `omaclone-askpass` | Hands the typed login to git for one clone |
+| `omaclone-askpass`, `omaclone-askpass-ssh` | Hand the typed https login (exact origin only) or SSH key passphrase to git/ssh for one clone |
 | `omaclone` | The backend (Python): link cleanup, `git ls-remote` check, `git clone` with progress, folder suggestions, the folder browser (`ls`, `mkdir`), history |
 | `tests/` | The tests |
 | `poster/`, `preview.png` | Cover image |

@@ -1,0 +1,8 @@
+#!/bin/bash
+# The SSH_ASKPASS helper of omaclone, for SSH keys with a passphrase. It answers only ssh's "Enter passphrase for key"
+# prompt, from OMACLONE_KEY_PASS: the passphrase unlocks a key on this computer and is never sent to a server. Any other
+# question (host key confirmation, a password) gets no answer. It knows nothing about https logins.
+case "$1" in
+  *assphrase*) printf '%s\n' "${OMACLONE_KEY_PASS-}" ;;
+  *) exit 1 ;;
+esac

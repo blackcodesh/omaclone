@@ -1,17 +1,17 @@
 #!/bin/bash
-# The GIT_ASKPASS / SSH_ASKPASS helper of omaclone. git (or ssh) asks it for a username, a password or a key passphrase;
-# the answer comes from the environment of that one clone, set by omaclone from what you typed in the sign-in card.
-# A username or password is only given for the server you signed in to (OMACLONE_HOST), so a submodule or a redirect
-# that points at another server gets nothing. Nothing is stored or logged here.
+# The GIT_ASKPASS helper of omaclone, for https servers. git asks it for a username or a password; the answer comes from
+# the environment of that one clone, set by omaclone from what you typed in the sign-in card (or the link).
+# It answers ONLY when the prompt names exactly the origin you signed in to (OMACLONE_ORIGIN = scheme://host[:port]):
+# a submodule or a redirect that points anywhere else gets nothing. Nothing is stored or logged here.
 prompt="$1"
-same_host() {
-  local url="${prompt#*\'}"; url="${url%%\'*}"          # Username for 'https://user@host:port': -> https://user@host:port
-  local rest="${url#*://}"; rest="${rest%%/*}"; rest="${rest##*@}"
-  [ -n "${OMACLONE_HOST-}" ] && [ "${rest,,}" = "${OMACLONE_HOST,,}" ]
-}
+origin="${OMACLONE_ORIGIN-}"
+[ -n "$origin" ] || exit 1
+url="${prompt#*\'}"; url="${url%%\'*}"                  # Username for 'https://user@host:port': -> https://user@host:port
+case "$url" in *://*) ;; *) exit 1 ;; esac
+scheme="${url%%://*}"; rest="${url#*://}"; rest="${rest%%/*}"; rest="${rest##*@}"
+[ "${scheme,,}://${rest,,}" = "${origin,,}" ] || exit 1
 case "$prompt" in
-  Username* | username*) same_host && printf '%s\n' "${OMACLONE_USER-}" || exit 1 ;;
-  Password* | password*) same_host && printf '%s\n' "${OMACLONE_PASS-}" || exit 1 ;;
-  *assphrase*) printf '%s\n' "${OMACLONE_PASS-}" ;;     # ssh: Enter passphrase for key '...' (a local key, never sent)
+  Username* | username*) printf '%s\n' "${OMACLONE_USER-}" ;;
+  Password* | password*) printf '%s\n' "${OMACLONE_PASS-}" ;;
   *) exit 1 ;;
 esac

@@ -159,7 +159,7 @@ Panel {
   }
 
   function parseNow() {
-    var text = root.splitSecret(root.url.trim()).text      // never hand a secret to a command line, whatever set the field
+    var text = root.url.trim()
     if (text === "") {
       root.parsed = null
       root.checkResult = null
@@ -167,9 +167,10 @@ Panel {
       return
     }
     root.parseSerial += 1
-    root.tool(["parse", text], function(out, serial) {
+    root.tool(["parse", "--stdin"], function(out, serial) {
       if (serial !== root.parseSerial) return
       var p = root.json(out)
+      if (p && (p.login || p.wipe)) { root.applyParsed(p, text); return }     // the field changes, which parses again
       root.parsed = p
       root.checkResult = null
       if (p && p.ok) {
@@ -185,7 +186,7 @@ Panel {
       } else {
         root.checking = false
       }
-    }, root.parseSerial)
+    }, root.parseSerial, text + "\n")
   }
 
   Timer {
@@ -307,32 +308,45 @@ Panel {
     })
   }
 
-  // A password or token inside a link (https://user:TOKEN@host/...) is taken out of the text at once: it goes to the
-  // sign-in card, and the link in the field and on every command line keeps only the username.
-  function splitSecret(text) {
-    var m = /(https?:\/\/)([^\/\s:@]*):([^\/\s@]+)@([^\/\s:]+)/.exec(text)
-    if (m) {
-      var u = ""
-      try { u = decodeURIComponent(m[2]) } catch (e) { u = m[2] }
-      var pw = ""
-      try { pw = decodeURIComponent(m[3]) } catch (e) { pw = m[3] }
-      return { text: text.replace(m[0], m[1] + (m[2] !== "" ? m[2] + "@" : "") + m[4]), user: u, pass: pw, host: m[4].toLowerCase() }
-    }
-    var t = /(https?:\/\/)([A-Za-z0-9_\-.]{20,})@([^\/\s:]+)/.exec(text)     // a bare token as the username
-    if (t) return { text: text.replace(t[0], t[1] + t[3]), user: t[2], pass: t[2], host: t[3].toLowerCase() }
-    return { text: text, user: "", pass: "", host: "" }
-  }
+  // The backend is the only thing that reads a link. It takes a password or token out of it (any link form) and hands it
+  // back as `login`, with the link cleaned (`cleanText`). The link goes to it on stdin, never as a command-line argument,
+  // and the field only ever keeps the cleaned text.
+  property int acceptSerial: 0
+  property string linkError: ""
 
-  function setLink(text) {
-    var s = root.splitSecret(text)
-    if (s.pass !== "") {
-      root.signinHost = s.host
-      root.signinUser = s.user
+  function applyParsed(p, text) {
+    if (p && p.wipe) {                               // a password that cannot be told from a path: refuse, show nothing of it
+      root.url = ""
+      root.linkError = p.message || ""
+      urlField.sync()
+      return
+    }
+    root.linkError = ""
+    if (p && p.ok && p.login) {
+      root.signinHost = String(p.host || "").toLowerCase()
+      root.signinUser = p.login.user
       root.signinUserEdited = true
-      root.signinPass = s.pass
+      root.signinPass = p.login.password
       root.signinOpen = true
     }
-    root.url = s.text
+    root.url = (p && p.cleanText !== undefined) ? p.cleanText : text
+    urlField.sync()
+  }
+
+  // Set the link field from anything: typing, the clipboard, a script. Text without an @ cannot hold a login.
+  function acceptLink(text, then) {
+    if (text.indexOf("@") < 0) {
+      root.linkError = ""
+      root.url = text
+      if (then) then()
+      return
+    }
+    root.acceptSerial += 1
+    root.tool(["parse", "--stdin"], function(out, serial) {
+      if (serial !== root.acceptSerial) return
+      root.applyParsed(root.json(out), text)
+      if (then) then()
+    }, root.acceptSerial, text + "\n")
   }
 
   function looksLikeLink(text) {
@@ -346,14 +360,13 @@ Panel {
       if (text === "" || text.length > 600 || root.url.trim() !== "" || root.phase === "cloning") return
       // Only text that already looks like a git link is looked at: a copied password never reaches a command line.
       if (!root.looksLikeLink(text)) return
-      var clean = root.splitSecret(text).text
-      root.tool(["parse", clean], function(parsedOut) {
+      root.tool(["parse", "--stdin"], function(parsedOut) {
         var p = root.json(parsedOut)
         if (p && p.ok && root.url.trim() === "") {
           root.fromClipboard = true
-          root.setLink(text)
+          root.applyParsed(p, text)
         }
-      })
+      }, 0, text + "\n")
     })
   }
 
@@ -374,6 +387,7 @@ Panel {
 
   function resetForm() {
     clearSecrets()
+    root.linkError = ""
     root.signinOpen = false
     root.signinError = ""
     root.signinBusy = false
@@ -523,7 +537,7 @@ Panel {
     target: "omaclone"
     function fill(text: string): string {
       root.resetForm()
-      root.setLink(text)
+      root.acceptLink(text)
       root.open()
       return "ok"
     }
@@ -550,12 +564,13 @@ Panel {
     }
     function clone(text: string, dir: string): string {
       root.resetForm()
-      root.setLink(text)
-      if (dir !== "") root.folder = dir
       root.open()
-      parseTimer.stop()
-      root.parseNow()
-      cloneWhenReady.restart()
+      root.acceptLink(text, function() {
+        if (dir !== "") root.folder = dir
+        parseTimer.stop()
+        root.parseNow()
+        cloneWhenReady.restart()
+      })
       return "ok"
     }
   }
@@ -637,7 +652,8 @@ Panel {
   component Input: TextField {
     property string value: ""
     signal edited(string typed)
-    onValueChanged: if (text !== value) text = value
+    function sync() { if (text !== value) text = value }
+    onValueChanged: sync()
     Component.onCompleted: text = value
     onTextEdited: edited(text)
   }
@@ -711,7 +727,7 @@ Panel {
           placeholderText: "Paste a link from GitHub, Forgejo, Codeberg, GitLab…"
           value: root.url
           enabled: root.phase !== "cloning"
-          onEdited: function(t) { root.fromClipboard = false; root.setLink(t) }
+          onEdited: function(t) { root.fromClipboard = false; root.acceptLink(t) }
           onAccepted: folderField.forceActiveFocus()
         }
         // what the link was understood as
@@ -765,6 +781,7 @@ Panel {
           width: parent.width
           visible: text !== ""
           text: {
+            if (root.linkError !== "") return root.linkError
             if (root.url.trim() === "") return "Copy a repository link in your browser, then open this: it is filled in for you."
             if (root.parsed && !root.parsed.ok) return root.parsed.message
             if (root.checking) return "Checking the link…"
@@ -774,6 +791,7 @@ Panel {
             return (c.status === "auth" ? "Needs sign-in. " : c.status === "notfound" ? "Not found. " : c.status === "network" ? "Cannot reach it. " : "") + (c.hint || c.message || "")
           }
           color: {
+            if (root.linkError !== "") return Commons.Color.urgent
             if (root.parsed && !root.parsed.ok) return Commons.Color.urgent
             var c = root.checkResult
             if (c && c.status === "ok") return Commons.Color.accent

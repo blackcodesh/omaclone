@@ -29,17 +29,32 @@ class PanelSafety(unittest.TestCase):
         self.assertIn('["python3", "-I", root.toolPath]', SRC)
 
     def test_the_clipboard_is_filtered_before_it_reaches_a_command(self):
-        self.assertIn("root.looksLikeLink(text)", SRC)
         start = SRC.index("function readClipboard")
-        self.assertLess(SRC.index("root.looksLikeLink(text)", start), SRC.index('root.tool(["parse", clean]', start))
-        self.assertIn("var clean = root.splitSecret(text).text", SRC[start:])
+        self.assertLess(SRC.index("root.looksLikeLink(text)", start), SRC.index('root.tool(["parse", "--stdin"]', start))
 
-    def test_no_link_reaches_a_command_with_a_secret_in_it(self):
-        # every place a link is stored goes through setLink, and the parser only ever gets the cleaned text
+    def test_every_link_goes_to_the_parser_on_stdin_never_as_an_argument(self):
         import re
-        self.assertEqual(re.findall(r"root\.url = (?!\"\")(\S+)", SRC), ["s.text"])
-        self.assertIn('root.tool(["parse", text]', SRC)
-        self.assertIn("var text = root.splitSecret(root.url.trim()).text", SRC)
+        calls = re.findall(r'\.tool\(\["parse"[^\]]*\]', SRC)
+        self.assertGreaterEqual(len(calls), 3)
+        for call in calls:
+            self.assertEqual(call, '.tool(["parse", "--stdin"]', call)
+
+    def test_no_id_is_declared_twice(self):
+        # a repeated id makes the whole panel fail to load, which the other tests cannot see
+        import re, collections
+        ids = collections.Counter(re.findall(r"^\s*id:\s*(\w+)\s*$", SRC, re.M))
+        self.assertEqual([k for k, v in ids.items() if v > 1], [])
+
+    def test_the_panel_has_no_parser_of_its_own(self):
+        self.assertNotIn("splitSecret", SRC)
+        self.assertNotRegex(SRC, r"/\(https\?")                          # no hand-written link regular expression
+
+    def test_the_link_field_only_ever_keeps_the_cleaned_text(self):
+        import re
+        assigned = [m for m in re.findall(r"root\.url = ([^\n]+)", SRC) if m.strip() != '""']
+        # typing without an @, the cleaned text from the backend, and a reset
+        self.assertEqual(sorted(a.strip() for a in assigned), sorted(["text", "(p && p.cleanText !== undefined) ? p.cleanText : text"]))
+        self.assertIn('if (text.indexOf("@") < 0)', SRC)
 
     def test_the_passphrase_and_the_password_are_separate_variables(self):
         self.assertIn("password: isSsh ? keyPass : signinPass", SRC)
