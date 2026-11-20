@@ -200,7 +200,7 @@ def parse_url(raw, scheme):
     path = "/".join(repo_segs)
     userinfo = ""
     if u.username:
-        userinfo = urllib.parse.quote(u.username, safe="") + (":" + urllib.parse.quote(u.password, safe="") if u.password else "") + "@"
+        userinfo = urllib.parse.quote(urllib.parse.unquote(u.username), safe="") + (":" + urllib.parse.quote(urllib.parse.unquote(u.password), safe="") if u.password else "") + "@"
     elif scheme in ("ssh", "git+ssh", "ssh+git"):
         userinfo = ""
     port = f":{u.port}" if u.port else ""
@@ -238,7 +238,7 @@ def read_credentials():
 TRUST_NEW_HOST = False
 
 
-def git_env(creds=None, ssh=False):
+def git_env(creds=None, ssh=False, host=""):
     env = dict(os.environ)
     env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "LC_ALL": "C", "LANG": "C", "GIT_ASKPASS": env.get("GIT_ASKPASS", "")})
     env.pop("SSH_ASKPASS_REQUIRE", None)
@@ -259,9 +259,16 @@ def git_env(creds=None, ssh=False):
                 pass
         # git asks the helper, which answers from these two variables of this one child process (not argv, not a file)
         env["GIT_ASKPASS"] = ASKPASS
+        env["OMACLONE_HOST"] = host
         env["OMACLONE_USER"] = creds["user"]
         env["OMACLONE_PASS"] = creds["password"]
     return env
+
+
+def host_key(p):
+    """host[:port] as git prints it in a prompt, the only server a typed login may be given to."""
+    host = (p.get("host") or "").lower()
+    return host + (f":{p['port']}" if p.get("port") else "")
 
 
 def config_for(creds):
@@ -311,7 +318,7 @@ def check(url, ref_tail="", creds=None):
         return {"status": "invalid", "message": p.get("message", "")}
     cmd = ["git", *config_for(creds), "ls-remote", "--symref", "--", p["cloneUrl"], "HEAD", "refs/heads/*", "refs/tags/*"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=git_env(creds, p["scheme"] in ("ssh", "git+ssh", "ssh+git")), timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=git_env(creds, p["scheme"] in ("ssh", "git+ssh", "ssh+git"), host_key(p)), timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return {"status": "network", "message": "The server did not answer in time", "hint": HINTS["network"]}
     except FileNotFoundError:
@@ -605,7 +612,7 @@ def clone(url, folder, name, branch="", shallow=False, submodules=False, creds=N
     out({"event": "start", "path": tilde(dest), "url": p["display"], "provider": p["provider"]})
     started = time.time()
     try:
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=git_env(creds, p["scheme"] in ("ssh", "git+ssh", "ssh+git")), start_new_session=True, bufsize=0)
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=git_env(creds, p["scheme"] in ("ssh", "git+ssh", "ssh+git"), host_key(p)), start_new_session=True, bufsize=0)
     except FileNotFoundError:
         out({"event": "error", "code": "git", "message": "git is not installed"})
         return 2
@@ -664,6 +671,15 @@ def clone(url, folder, name, branch="", shallow=False, submodules=False, creds=N
         remember(p["display"], parent, name, dest)
     except OSError:
         pass
+    if p.get("hasPassword") and p["scheme"] in ("http", "https"):
+        # a token that came in the link must not stay in the repository's remote: keep the link without the password
+        try:
+            u = urllib.parse.urlsplit(p["cloneUrl"])
+            netloc = (urllib.parse.quote(p["user"], safe="") + "@" if p.get("user") else "") + u.netloc.rsplit("@", 1)[-1]
+            subprocess.run(["git", "-C", dest, "remote", "set-url", "origin", urllib.parse.urlunsplit((u.scheme, netloc, u.path, "", ""))],
+                           capture_output=True, timeout=15)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
     if p.get("scheme") == "ssh" and p.get("port"):
         try:
             remember_port(p["host"], p["port"])

@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "omaclone")
@@ -477,6 +478,7 @@ class Clone(Env):
 
 GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
 PASSWORD = "p@ss:w/rd#?%&\"'$x"
+PASSWORD_URL = urllib.parse.quote(PASSWORD, safe="")
 
 
 class GitHttp(http.server.BaseHTTPRequestHandler):
@@ -501,6 +503,7 @@ class GitHttp(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        self.server.logins = getattr(self.server, "logins", 0) + 1
         path, _, query = self.path.partition("?")
         env = {"GIT_PROJECT_ROOT": self.server.root, "GIT_HTTP_EXPORT_ALL": "1", "REQUEST_METHOD": self.command, "PATH_INFO": path,
                "QUERY_STRING": query, "CONTENT_TYPE": self.headers.get("Content-Type", ""), "CONTENT_LENGTH": str(len(body)),
@@ -678,7 +681,7 @@ class SignIn(Env):
 
     def test_the_helper_script_answers_only_from_the_environment(self):
         helper = os.path.join(ROOT, "omaclone-askpass")
-        env = dict(os.environ, OMACLONE_USER="u ser", OMACLONE_PASS="pw -n \\x")
+        env = dict(os.environ, OMACLONE_USER="u ser", OMACLONE_PASS="pw -n \\x", OMACLONE_HOST="h")
         def ask(prompt):
             return subprocess.run([helper, prompt], capture_output=True, text=True, env=env)
         self.assertEqual(ask("Username for 'https://h': ").stdout, "u ser\n")
@@ -686,6 +689,54 @@ class SignIn(Env):
         r = ask("Are you sure you want to continue connecting (yes/no)? ")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
+
+    def test_the_login_is_only_given_to_the_server_it_was_typed_for(self):
+        helper = os.path.join(ROOT, "omaclone-askpass")
+        env = dict(os.environ, OMACLONE_USER="alice", OMACLONE_PASS="PW", OMACLONE_HOST="git.example.org:3000")
+        def ask(p, e=env):
+            return subprocess.run([helper, p], capture_output=True, text=True, env=e)
+        self.assertEqual(ask("Password for 'https://alice@git.example.org:3000': ").stdout, "PW\n")
+        self.assertEqual(ask("Password for 'https://GIT.Example.org:3000': ").stdout, "PW\n")
+        for other in ("Password for 'https://alice@evil.example.net': ", "Password for 'https://git.example.org': ",
+                      "Username for 'https://git.example.org.evil.net:3000': ", "Password for 'https://x@git.example.org:3001': "):
+            r = ask(other)
+            self.assertNotEqual(r.returncode, 0, other)
+            self.assertEqual(r.stdout, "", other)
+        no_host = {k: v for k, v in env.items() if k != "OMACLONE_HOST"}
+        self.assertNotEqual(ask("Password for 'https://git.example.org:3000': ", no_host).returncode, 0)
+
+    def test_a_submodule_on_another_server_does_not_get_the_login(self):
+        second = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GitHttp)
+        second.root, second.user, second.password = self.httpd.root, "alice", PASSWORD
+        threading.Thread(target=second.serve_forever, daemon=True).start()
+        try:
+            work = os.path.join(self.home, "parentwork")
+            subprocess.run(["git", "clone", "-q", os.path.join(self.httpd.root, "owner", "proj.git"), work], check=True, capture_output=True)
+            sha = subprocess.run(["git", "-C", work, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+            with open(os.path.join(work, ".gitmodules"), "w") as f:
+                f.write(f'[submodule "sub"]\n\tpath = sub\n\turl = http://127.0.0.1:{second.server_address[1]}/owner/proj.git\n')
+            subprocess.run(["git", "-C", work, "update-index", "--add", "--cacheinfo", f"160000,{sha},sub"], check=True)
+            subprocess.run(["git", "-C", work, "add", ".gitmodules"], check=True)
+            subprocess.run(["git", "-C", work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sub"], check=True)
+            subprocess.run(["git", "clone", "-q", "--bare", work, os.path.join(self.httpd.root, "owner", "parent.git")], check=True)
+            url = f"http://127.0.0.1:{self.httpd.server_address[1]}/owner/parent.git"
+            r, ev = self.run_tool("clone", url, os.path.join(self.home, "c"), "--submodules", "--credentials-from-stdin", env=self.creds_env(), stdin_text=self.login + "\n")
+            self.assertNotEqual(r.returncode, 0, "the submodule on the other server should not have been signed in")
+            self.assertFalse(os.path.exists(os.path.join(self.home, "c", "parent", "sub", "f2.txt")))
+        finally:
+            second.shutdown()
+            second.server_close()
+
+    def test_a_token_in_the_link_is_not_left_in_the_remote(self):
+        url = self.url.replace("http://", f"http://alice:{PASSWORD_URL}@")
+        r, ev = self.run_tool("clone", url, os.path.join(self.home, "c"), env=self.creds_env())
+        self.assertEqual(r.returncode, 0, ev)
+        with open(os.path.join(self.home, "c", "proj", ".git", "config")) as f:
+            config = f.read()
+        self.assertNotIn(PASSWORD_URL, config)
+        self.assertNotIn(PASSWORD, config)
+        self.assertIn("alice@127.0.0.1", config)
+        self.assertNotIn(PASSWORD_URL, r.stdout + r.stderr)
 
     def test_the_link_can_carry_the_username(self):
         p = M.parse(f"http://alice@127.0.0.1:1234/o/r.git")

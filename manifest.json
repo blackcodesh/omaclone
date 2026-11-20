@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "blackcode.omaclone",
   "name": "OmaClone",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "BlackCode",
   "license": "MIT",
   "description": "OmaClone: paste a git link, pick a folder, clone. Works with GitHub, Forgejo, Codeberg, GitLab, Gitea, Bitbucket, SourceHut and any git server; cleans up links copied from the browser and shows live progress",

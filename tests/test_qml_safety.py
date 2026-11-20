@@ -30,7 +30,20 @@ class PanelSafety(unittest.TestCase):
 
     def test_the_clipboard_is_filtered_before_it_reaches_a_command(self):
         self.assertIn("root.looksLikeLink(text)", SRC)
-        self.assertLess(SRC.index("root.looksLikeLink(text)"), SRC.index('root.tool(["parse", text]', SRC.index("function readClipboard")))
+        start = SRC.index("function readClipboard")
+        self.assertLess(SRC.index("root.looksLikeLink(text)", start), SRC.index('root.tool(["parse", clean]', start))
+        self.assertIn("var clean = root.splitSecret(text).text", SRC[start:])
+
+    def test_no_link_reaches_a_command_with_a_secret_in_it(self):
+        # every place a link is stored goes through setLink, and the parser only ever gets the cleaned text
+        import re
+        self.assertEqual(re.findall(r"root\.url = (?!\"\")(\S+)", SRC), ["s.text"])
+        self.assertIn('root.tool(["parse", text]', SRC)
+        self.assertIn("var text = root.splitSecret(root.url.trim()).text", SRC)
+
+    def test_the_passphrase_and_the_password_are_separate_variables(self):
+        self.assertIn("password: isSsh ? keyPass : signinPass", SRC)
+        self.assertNotIn("signinPass = root.keyPass", SRC)
 
     def test_clipboard_is_only_used_when_it_is_a_git_link(self):
         self.assertRegex(SRC, r"p && p\.ok && root\.url\.trim\(\) === \"\"")

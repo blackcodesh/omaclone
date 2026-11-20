@@ -48,7 +48,8 @@ Panel {
   property string signinUser: ""
   property bool signinUserEdited: false
   property string signinHost: ""
-  property string signinPass: ""
+  property string signinPass: ""        // password or token for an https server
+  property string keyPass: ""           // passphrase of an SSH key: a separate variable, so one can never be sent as the other
   property bool signinRemember: false
   property string signinError: ""
   property bool signinBusy: false
@@ -77,8 +78,8 @@ Panel {
   readonly property bool askLogin: canSignIn || isSsh
   readonly property bool authNeeded: askLogin && checkResult !== null && checkResult.status === "auth"
   readonly property bool signinVisible: askLogin && (signinOpen || authNeeded) && phase !== "cloning" && phase !== "done"
-  readonly property bool hasLogin: isSsh ? signinPass !== "" : (signinUser.trim() !== "" || signinPass !== "")
-  readonly property string loginJson: JSON.stringify({ user: isSsh ? "" : signinUser.trim(), password: signinPass, remember: !isSsh && signinRemember && credHelper })
+  readonly property bool hasLogin: isSsh ? keyPass !== "" : (signinUser.trim() !== "" || signinPass !== "")
+  readonly property string loginJson: JSON.stringify({ user: isSsh ? "" : signinUser.trim(), password: isSsh ? keyPass : signinPass, remember: !isSsh && signinRemember && credHelper })
 
   // ---- Folder browser ----
   property bool browseOpen: false
@@ -158,7 +159,7 @@ Panel {
   }
 
   function parseNow() {
-    var text = root.url.trim()
+    var text = root.splitSecret(root.url.trim()).text      // never hand a secret to a command line, whatever set the field
     if (text === "") {
       root.parsed = null
       root.checkResult = null
@@ -175,7 +176,7 @@ Panel {
         root.trustHost = false
         root.protocol = (p.scheme === "ssh") ? "ssh" : (p.scheme === "git" ? "git" : "https")
         root.sshPort = (p.scheme === "ssh" && p.port) ? String(p.port) : (root.knownPorts[p.host] ? String(root.knownPorts[p.host]) : "")
-        if (p.host !== root.signinHost) { root.signinHost = p.host; root.signinUserEdited = false; root.signinPass = "" }
+        if (p.host !== root.signinHost) { root.signinHost = p.host; root.signinUserEdited = false; root.signinPass = ""; root.keyPass = "" }
         if (!root.signinUserEdited) root.signinUser = p.user || root.knownUsers[p.host] || ""
         if (!root.nameEdited) root.folderName = p.name
         if (!root.branchEdited) root.branch = p.branch || ""
@@ -196,6 +197,8 @@ Panel {
   function chooseProtocol(name) {
     if (!root.canChoose || root.protocol === name || root.phase === "cloning") return
     root.protocol = name
+    root.signinPass = ""
+    root.keyPass = ""
     root.trustHost = false
     root.signinError = ""
     root.checkResult = null
@@ -304,6 +307,34 @@ Panel {
     })
   }
 
+  // A password or token inside a link (https://user:TOKEN@host/...) is taken out of the text at once: it goes to the
+  // sign-in card, and the link in the field and on every command line keeps only the username.
+  function splitSecret(text) {
+    var m = /(https?:\/\/)([^\/\s:@]*):([^\/\s@]+)@([^\/\s:]+)/.exec(text)
+    if (m) {
+      var u = ""
+      try { u = decodeURIComponent(m[2]) } catch (e) { u = m[2] }
+      var pw = ""
+      try { pw = decodeURIComponent(m[3]) } catch (e) { pw = m[3] }
+      return { text: text.replace(m[0], m[1] + (m[2] !== "" ? m[2] + "@" : "") + m[4]), user: u, pass: pw, host: m[4].toLowerCase() }
+    }
+    var t = /(https?:\/\/)([A-Za-z0-9_\-.]{20,})@([^\/\s:]+)/.exec(text)     // a bare token as the username
+    if (t) return { text: text.replace(t[0], t[1] + t[3]), user: t[2], pass: t[2], host: t[3].toLowerCase() }
+    return { text: text, user: "", pass: "", host: "" }
+  }
+
+  function setLink(text) {
+    var s = root.splitSecret(text)
+    if (s.pass !== "") {
+      root.signinHost = s.host
+      root.signinUser = s.user
+      root.signinUserEdited = true
+      root.signinPass = s.pass
+      root.signinOpen = true
+    }
+    root.url = s.text
+  }
+
   function looksLikeLink(text) {
     return /^(git\s+clone\s+(-\S+\s+(\S+\s+)?)*)?(https?:\/\/|ssh:\/\/|git:\/\/|git\+ssh:\/\/|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:|[A-Za-z0-9.-]+\.[A-Za-z]{2,}\/)\S/.test(text)
   }
@@ -315,11 +346,12 @@ Panel {
       if (text === "" || text.length > 600 || root.url.trim() !== "" || root.phase === "cloning") return
       // Only text that already looks like a git link is looked at: a copied password never reaches a command line.
       if (!root.looksLikeLink(text)) return
-      root.tool(["parse", text], function(parsedOut) {
+      var clean = root.splitSecret(text).text
+      root.tool(["parse", clean], function(parsedOut) {
         var p = root.json(parsedOut)
         if (p && p.ok && root.url.trim() === "") {
           root.fromClipboard = true
-          root.url = text
+          root.setLink(text)
         }
       })
     })
@@ -337,6 +369,7 @@ Panel {
 
   function clearSecrets() {
     root.signinPass = ""
+    root.keyPass = ""
   }
 
   function resetForm() {
@@ -490,7 +523,7 @@ Panel {
     target: "omaclone"
     function fill(text: string): string {
       root.resetForm()
-      root.url = text
+      root.setLink(text)
       root.open()
       return "ok"
     }
@@ -517,7 +550,7 @@ Panel {
     }
     function clone(text: string, dir: string): string {
       root.resetForm()
-      root.url = text
+      root.setLink(text)
       if (dir !== "") root.folder = dir
       root.open()
       parseTimer.stop()
@@ -534,7 +567,7 @@ Panel {
     property int tries: 0
     onTriggered: {
       tries += 1
-      if (root.urlOk && root.nameOk && root.folder !== "") { stop(); tries = 0; root.startClone() }
+      if (root.urlOk && root.nameOk && root.folder !== "") { stop(); tries = 0; if (root.hasLogin && root.canSignIn) root.signInAndClone(); else root.startClone() }
       else if (tries > 20) { stop(); tries = 0 }
     }
   }
@@ -678,7 +711,7 @@ Panel {
           placeholderText: "Paste a link from GitHub, Forgejo, Codeberg, GitLab…"
           value: root.url
           enabled: root.phase !== "cloning"
-          onEdited: function(t) { root.fromClipboard = false; root.url = t }
+          onEdited: function(t) { root.fromClipboard = false; root.setLink(t) }
           onAccepted: folderField.forceActiveFocus()
         }
         // what the link was understood as
@@ -803,9 +836,9 @@ Panel {
                 width: parent.width
                 password: true
                 placeholderText: root.isSsh ? "passphrase of your SSH key" : "password or access token"
-                value: root.signinPass
+                value: root.isSsh ? root.keyPass : root.signinPass
                 enabled: root.phase !== "cloning" && !root.signinBusy
-                onEdited: function(t) { root.signinPass = t; root.signinError = "" }
+                onEdited: function(t) { if (root.isSsh) root.keyPass = t; else root.signinPass = t; root.signinError = "" }
                 onAccepted: root.cloneClicked()
               }
             }
