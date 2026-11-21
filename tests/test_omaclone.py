@@ -151,15 +151,30 @@ class Parse(unittest.TestCase):
             "http://u:tok@host.org/o/r/tree/main": ("u", "tok"),
             "git clone -b dev https://u:tok@host.org/o/r": ("u", "tok"),
             "https://:tok@host.org/o/r": ("", "tok"),
-            "https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/o/r": ("ghp_abcdefghijklmnopqrstuvwxyz0123", "ghp_abcdefghijklmnopqrstuvwxyz0123"),
+            "https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/o/r": ("", "ghp_abcdefghijklmnopqrstuvwxyz0123"),
         }
         for link, (user, secret) in cases.items():
             p = M.parse(link)
             self.assertTrue(p["ok"], link)
-            self.assertEqual(p["login"], {"user": user, "password": secret}, link)
+            self.assertEqual({k: p["login"][k] for k in ("user", "password")}, {"user": user, "password": secret}, link)
             for field in ("cloneUrl", "display", "cleanText", "webUrl", "webDisplay", "sshUrl"):
                 self.assertNotIn(secret, p.get(field) or "", (link, field))
             self.assertTrue(p["hasPassword"])
+
+    def test_a_token_that_is_the_whole_login_is_not_a_username(self):
+        token = "ghp_abcdefghijklmnopqrstuvwxyz0123"
+        p = M.parse(f"https://{token}@github.com/o/r")
+        self.assertEqual(p["login"], {"user": "", "password": token, "tokenAsUser": True})
+        self.assertEqual(p["user"], "")                                    # nothing for the panel to show as a username
+        for field in ("cloneUrl", "display", "cleanText", "webUrl", "sshUrl", "user"):
+            self.assertNotIn(token, p.get(field) or "", field)
+
+    def test_each_link_reports_its_exact_web_origin(self):
+        self.assertEqual(M.parse("https://Git.Example.org/o/r")["webOrigin"], "https://git.example.org")
+        self.assertEqual(M.parse("https://git.example.org:8443/o/r")["webOrigin"], "https://git.example.org:8443")
+        self.assertEqual(M.parse("http://git.example.org/o/r")["webOrigin"], "http://git.example.org")
+        self.assertEqual(M.parse("git@git.example.org:o/r.git")["webOrigin"], "https://git.example.org")
+        self.assertEqual(M.parse("ssh://git@git.example.org:2222/o/r.git")["webOrigin"], "https://git.example.org")      # not the ssh port
 
     def test_the_cleaned_text_keeps_the_rest_of_what_was_pasted(self):
         p = M.parse("git clone -b dev https://u:tok@host.org/o/r")
@@ -661,7 +676,7 @@ class SignIn(Env):
             with open(os.path.join(state_dir, name)) as f:
                 self.assertNotIn(PASSWORD, f.read(), name)
         r, [s] = self.run_tool("state", env=self.creds_env())
-        self.assertEqual(s["users"], {"127.0.0.1": "alice"})
+        self.assertEqual(s["users"], {})                                   # Remember was off: not even the username is kept
 
     def test_the_password_is_not_on_any_command_line(self):
         shim = os.path.join(self.home, "bin")
@@ -690,6 +705,43 @@ class SignIn(Env):
         # ...so a later clone needs no login at all
         r, ev = self.run_tool("clone", self.url, os.path.join(self.home, "c2"), env=env)
         self.assertEqual(r.returncode, 0, ev)
+
+    def test_a_username_is_only_remembered_when_remember_is_on(self):
+        login = json.dumps({"user": "alice", "password": PASSWORD, "remember": True})
+        r, ev = self.run_tool("clone", self.url, os.path.join(self.home, "c"), "--credentials-from-stdin", env=self.creds_env(os.path.join(self.home, "st")), stdin_text=login + "\n")
+        self.assertEqual(r.returncode, 0, ev)
+        r, [s] = self.run_tool("state", env=self.creds_env())
+        self.assertEqual(s["users"], {"127.0.0.1": "alice"})
+
+    def test_a_token_only_login_is_used_but_never_shown_or_saved(self):
+        token = "tok_" + "x" * 24
+        self.httpd.user, self.httpd.password = token, token
+        env, log = self.shim_git()
+        login = json.dumps({"user": "", "password": token, "tokenAsUser": True, "remember": True})
+        r, ev = self.run_tool("clone", self.url, os.path.join(self.home, "c"), "--credentials-from-stdin", env=dict(env, **{}), stdin_text=login + "\n")
+        self.assertEqual(r.returncode, 0, ev)
+        with open(log) as f:
+            self.assertNotIn(token, f.read())
+        state = os.path.join(self.home, "state", "omaclone")
+        for name in os.listdir(state):
+            with open(os.path.join(state, name)) as f:
+                self.assertNotIn(token, f.read(), name)
+        with open(os.path.join(self.home, "c", "proj", ".git", "config")) as f:
+            self.assertNotIn(token, f.read())
+        self.assertFalse(ev[-1]["remembered"])
+        r, [s] = self.run_tool("state", env=self.creds_env())
+        self.assertEqual(s["users"], {})
+
+    def test_a_token_in_the_link_works_without_being_kept(self):
+        token = "tok_" + "y" * 24
+        self.httpd.user, self.httpd.password = token, token
+        url = self.url.replace("http://", f"http://{token}@")
+        r, ev = self.run_tool("clone", url, os.path.join(self.home, "c"), env=self.creds_env())
+        self.assertEqual(r.returncode, 0, ev)
+        r, [s] = self.run_tool("state", env=self.creds_env())
+        self.assertEqual(s["users"], {})
+        with open(os.path.join(self.home, "state", "omaclone", "history.json")) as f:
+            self.assertNotIn(token, f.read())
 
     def test_without_remember_nothing_is_stored(self):
         store = os.path.join(self.home, "stored-credentials")

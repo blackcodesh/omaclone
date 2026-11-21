@@ -47,7 +47,10 @@ Panel {
   property bool signinOpen: false
   property string signinUser: ""
   property bool signinUserEdited: false
-  property string signinHost: ""
+  property string signinHost: ""            // host of the SSH key passphrase (keyPass)
+  property string signinOrigin: ""          // scheme://host[:port] the typed web login belongs to: it never leaves it
+  property bool signinTokenAsUser: false    // the login is one token: it is sent as both user and password, never shown or saved as a username
+  property int signinTicket: 0              // changes whenever the target changes, which cancels a sign-in still in flight
   property string signinPass: ""        // password or token for an https server
   property string keyPass: ""           // passphrase of an SSH key: a separate variable, so one can never be sent as the other
   property bool signinRemember: false
@@ -78,8 +81,10 @@ Panel {
   readonly property bool askLogin: canSignIn || isSsh
   readonly property bool authNeeded: askLogin && checkResult !== null && checkResult.status === "auth"
   readonly property bool signinVisible: askLogin && (signinOpen || authNeeded) && phase !== "cloning" && phase !== "done"
+  readonly property string loginOrigin: (urlOk && !isSsh && canChoose) ? parsed.webOrigin : ""
   readonly property bool hasLogin: isSsh ? keyPass !== "" : (signinUser.trim() !== "" || signinPass !== "")
-  readonly property string loginJson: JSON.stringify({ user: isSsh ? "" : signinUser.trim(), password: isSsh ? keyPass : signinPass, remember: !isSsh && signinRemember && credHelper })
+  readonly property string loginJson: JSON.stringify({ user: isSsh ? "" : signinUser.trim(), password: isSsh ? keyPass : signinPass, remember: !isSsh && signinRemember && credHelper,
+                                                                tokenAsUser: !isSsh && signinTokenAsUser && signinUser.trim() === "" })
 
   // ---- Folder browser ----
   property bool browseOpen: false
@@ -177,7 +182,8 @@ Panel {
         root.trustHost = false
         root.protocol = (p.scheme === "ssh") ? "ssh" : (p.scheme === "git" ? "git" : "https")
         root.sshPort = (p.scheme === "ssh" && p.port) ? String(p.port) : (root.knownPorts[p.host] ? String(root.knownPorts[p.host]) : "")
-        if (p.host !== root.signinHost) { root.signinHost = p.host; root.signinUserEdited = false; root.signinPass = ""; root.keyPass = "" }
+        if (p.host !== root.signinHost) { root.signinHost = p.host; root.keyPass = "" }
+        if (root.signinOrigin !== "" && p.webOrigin !== root.signinOrigin) root.clearWebLogin()
         if (!root.signinUserEdited) root.signinUser = p.user || root.knownUsers[p.host] || ""
         if (!root.nameEdited) root.folderName = p.name
         if (!root.branchEdited) root.branch = p.branch || ""
@@ -324,6 +330,8 @@ Panel {
     root.linkError = ""
     if (p && p.ok && p.login) {
       root.signinHost = String(p.host || "").toLowerCase()
+      root.signinOrigin = p.webOrigin
+      root.signinTokenAsUser = p.login.tokenAsUser === true
       root.signinUser = p.login.user
       root.signinUserEdited = true
       root.signinPass = p.login.password
@@ -380,6 +388,23 @@ Panel {
     }
   }
 
+  function clearWebLogin() {
+    root.signinPass = ""
+    root.signinUser = ""
+    root.signinUserEdited = false
+    root.signinTokenAsUser = false
+    root.signinOrigin = ""
+    root.signinError = ""
+  }
+
+  // The typed login belongs to ONE origin. If the scheme, host or port changes, it is dropped; and any sign-in that is
+  // still on its way to the server is cancelled when the target (link, protocol, port) changes.
+  onLoginOriginChanged: {
+    if (loginOrigin !== "" && signinOrigin !== "" && loginOrigin !== signinOrigin) clearWebLogin()
+    signinTicket += 1
+  }
+  onEffectiveUrlChanged: { signinTicket += 1; signinBusy = false }
+
   function clearSecrets() {
     root.signinPass = ""
     root.keyPass = ""
@@ -393,6 +418,8 @@ Panel {
     root.signinBusy = false
     root.signinUser = ""
     root.signinUserEdited = false
+    root.signinOrigin = ""
+    root.signinTokenAsUser = false
     root.url = ""
     root.parsed = null
     root.checkResult = null
@@ -423,7 +450,9 @@ Panel {
     root.signinBusy = true
     root.signinError = ""
     var login = root.loginJson
+    var ticket = root.signinTicket
     root.tool(["check", root.effectiveUrl, root.parsed.refPath || "", "--credentials-from-stdin"], function(out) {
+      if (ticket !== root.signinTicket) { root.signinBusy = false; return }      // the target changed meanwhile: never clone it
       root.signinBusy = false
       var c = root.json(out)
       if (c && c.status === "ok") {
@@ -838,10 +867,10 @@ Panel {
               Input {
                 id: userField
                 width: parent.width
-                placeholderText: "username"
+                placeholderText: root.signinTokenAsUser ? "(the token is the login)" : "username"
                 value: root.signinUser
                 enabled: root.phase !== "cloning" && !root.signinBusy
-                onEdited: function(t) { root.signinUserEdited = true; root.signinUser = t; root.signinError = "" }
+                onEdited: function(t) { root.signinUserEdited = true; root.signinUser = t; if (t !== "") root.signinTokenAsUser = false; root.signinOrigin = root.loginOrigin; root.signinError = "" }
                 onAccepted: passField.forceActiveFocus()
               }
             }
@@ -856,7 +885,7 @@ Panel {
                 placeholderText: root.isSsh ? "passphrase of your SSH key" : "password or access token"
                 value: root.isSsh ? root.keyPass : root.signinPass
                 enabled: root.phase !== "cloning" && !root.signinBusy
-                onEdited: function(t) { if (root.isSsh) root.keyPass = t; else root.signinPass = t; root.signinError = "" }
+                onEdited: function(t) { if (root.isSsh) root.keyPass = t; else { root.signinPass = t; root.signinOrigin = root.loginOrigin } root.signinError = "" }
                 onAccepted: root.cloneClicked()
               }
             }

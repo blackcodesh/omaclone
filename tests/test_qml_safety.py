@@ -45,6 +45,26 @@ class PanelSafety(unittest.TestCase):
         ids = collections.Counter(re.findall(r"^\s*id:\s*(\w+)\s*$", SRC, re.M))
         self.assertEqual([k for k, v in ids.items() if v > 1], [])
 
+    def test_a_typed_login_is_bound_to_its_exact_origin(self):
+        self.assertIn("property string signinOrigin", SRC)
+        self.assertIn("loginOrigin !== signinOrigin", SRC)
+        self.assertIn("clearWebLogin()", SRC)
+        # the old host-only comparison is gone from the web login
+        self.assertNotIn("p.host !== root.signinHost) { root.signinHost = p.host; root.signinUserEdited", SRC)
+        self.assertIn("p.webOrigin !== root.signinOrigin", SRC)
+
+    def test_a_sign_in_on_its_way_is_cancelled_when_the_target_changes(self):
+        self.assertIn("onEffectiveUrlChanged: { signinTicket += 1", SRC)
+        self.assertIn("var ticket = root.signinTicket", SRC)
+        self.assertIn("if (ticket !== root.signinTicket)", SRC)
+        # the clone only starts after that check
+        self.assertLess(SRC.index("if (ticket !== root.signinTicket)"), SRC.index("root.startClone(true)", SRC.index("function signInAndClone")))
+
+    def test_a_token_only_login_is_never_copied_to_the_username(self):
+        self.assertIn("signinTokenAsUser", SRC)
+        self.assertIn("tokenAsUser: !isSsh && signinTokenAsUser && signinUser.trim() === \"\"", SRC)
+        self.assertNotIn("signinUser = p.login.password", SRC)
+
     def test_the_panel_has_no_parser_of_its_own(self):
         self.assertNotIn("splitSecret", SRC)
         self.assertNotRegex(SRC, r"/\(https\?")                          # no hand-written link regular expression

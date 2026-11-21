@@ -22,7 +22,11 @@
 
 Works with any git server (GitHub, Forgejo, Codeberg, GitLab, Gitea, Bitbucket, SourceHut, self-hosted): it is plain
 `git clone` underneath. It never asks for a password in the background; a repository that needs one is reported so you
-can sign in (username and password or token) or use an SSH link or a terminal. Links that can run commands (ext::, fd::) are refused."""
+can sign in (username and password or token) or use an SSH link or a terminal. Links that can run commands (ext::, fd::) are refused.
+Keep a password or token out of the <url> you type on a command line: other programs on this computer can read a command
+line while it runs. Use `omaclone parse --stdin` for a link, and --credentials-from-stdin for a login. A login that is in
+a link is taken out of it and used privately, but the argument was already visible to the system.
+"""
 import json
 import os
 import re
@@ -139,7 +143,7 @@ def split_userinfo(raw):
         if sep and password:
             login = {"user": user, "password": password}
         elif not sep and TOKENISH.fullmatch(user):          # a bare token in the user place
-            login, keep = {"user": user, "password": user}, ""
+            login, keep = {"user": "", "password": user, "tokenAsUser": True}, ""     # the token is the whole login
     return head + (urllib.parse.quote(keep, safe="") + "@" if keep else "") + hostport + tail, login, False
 
 
@@ -201,7 +205,9 @@ def alternates(scheme, host, user, path, base):
     ssh_user = user or "git"
     azure = host.lower() == "dev.azure.com" or host.lower().endswith(".visualstudio.com")
     ssh = None if azure or not re.fullmatch(r"[A-Za-z0-9._-]+", ssh_user) else f"{ssh_user}@{host}:{clean}"
-    return {"webUrl": web, "webDisplay": mask(web), "sshUrl": ssh, "sshUser": ssh_user,
+    w = urllib.parse.urlsplit(web)
+    web_origin = f"{w.scheme}://{(w.hostname or '').lower()}" + (f":{w.port}" if w.port else "")
+    return {"webUrl": web, "webDisplay": mask(web), "webOrigin": web_origin, "sshUrl": ssh, "sshUser": ssh_user,
             "sshPath": urllib.parse.quote(clean, safe="/~@:+,._-")}
 
 
@@ -281,7 +287,8 @@ def read_credentials():
     for v in (user, password):
         if len(v) > 1000 or re.search(r"[\x00\r\n]", v):
             return None
-    return {"user": user, "password": password, "remember": data.get("remember") is True}
+    return {"user": user, "password": password, "remember": data.get("remember") is True,
+            "tokenAsUser": data.get("tokenAsUser") is True and user == ""}
 
 
 TRUST_NEW_HOST = False
@@ -316,7 +323,7 @@ def git_env(creds=None, ssh=False, origin=""):
             env.pop("SSH_ASKPASS", None)
             env["GIT_ASKPASS"] = ASKPASS
             env["OMACLONE_ORIGIN"] = origin
-            env["OMACLONE_USER"] = creds["user"]
+            env["OMACLONE_USER"] = creds["password"] if creds.get("tokenAsUser") and not creds["user"] else creds["user"]
             env["OMACLONE_PASS"] = creds["password"]
     return env
 
@@ -330,7 +337,8 @@ def host_key(p):
 def link_login(p, creds):
     """The login to use: the one typed in the sign-in card, else the one that was in the link (https only)."""
     if creds is None and p.get("login") and p.get("scheme") in ("http", "https"):
-        return {"user": p["login"]["user"], "password": p["login"]["password"], "remember": False}
+        return {"user": p["login"]["user"], "password": p["login"]["password"], "remember": False,
+                "tokenAsUser": p["login"].get("tokenAsUser") is True}
     return creds
 
 
@@ -742,11 +750,12 @@ def clone(url, folder, name, branch="", shallow=False, submodules=False, creds=N
         except OSError:
             pass
     stored = False
-    if creds:
+    if creds and creds["remember"] and p["scheme"] in ("http", "https") and not creds.get("tokenAsUser"):
+        # nothing is saved unless "Remember this login" was switched on; a token is never kept as a username
         try:
-            if p["scheme"] in ("http", "https"):
+            if creds["user"] and creds["user"] != creds["password"]:
                 remember_user(p["host"], creds["user"])
-            if creds["remember"] and p["scheme"] in ("http", "https") and credential_helper_set():
+            if credential_helper_set():
                 stored = store_credentials(p, creds)
         except OSError:
             pass

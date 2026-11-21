@@ -8,6 +8,15 @@ Bitbucket, SourceHut and any other git server**, because underneath it is plain 
 
 **Compatibility:** works with Omarchy 4.5 (checked on 4.5.0-3: manifest validation, the plugin's own tests, a live run on a 4.5 bar, and real clones from GitHub and Codeberg).
 
+## What's new in 1.0.3
+
+More credential fixes from the marketplace review:
+
+- A typed login is bound to its exact origin (scheme, host and port). If any of them changes, the login is dropped from the form, and a sign-in that is still on its way is cancelled when the link, protocol or port changes.
+- A token that is the whole login is never copied into the username field, and is never saved.
+- A username is remembered only when you switch on "Remember this login" (it used to be saved after every signed-in clone).
+- Documented: keep a password or token out of a URL you type on a command line (use `parse --stdin` and `--credentials-from-stdin`).
+
 ## What's new in 1.0.2
 
 Follow-up credential fixes from the marketplace review:
@@ -126,6 +135,11 @@ o.bind("SUPER + ALT + G", "Clone a repository", "omarchy-shell blackcode.omaclon
 The backend works on its own too: `omaclone parse <link>`, `omaclone check <link>`, `omaclone clone <link> <folder>`,
 `omaclone ls <folder>`, `omaclone mkdir <parent> <name>` (see `omaclone --help`), printing JSON.
 
+**Keep a password or token out of a URL you type on a command line**: other programs on this computer can read a command
+line while it runs. For scripts use `omaclone parse --stdin` (the link on stdin) and `--credentials-from-stdin` (one JSON
+line: `{"user": "...", "password": "...", "remember": false}`). A login that is in a link is taken out of it and used
+privately, but the argument itself was already visible to the system. The panel always uses stdin.
+
 ## Privacy and safety
 
 - **What it contacts:** only the server in the link you paste, with `git ls-remote` (and `git clone` when you press
@@ -141,7 +155,7 @@ The backend works on its own too: `omaclone parse <link>`, `omaclone check <link
 - **Passwords**: what you type in the Sign in card is sent to the script over a pipe, never on a command line, and git
   reads it through a tiny helper (`omaclone-askpass`) from the environment of that one clone. It is not put in the
   link, not written to the cloned repository's config, not in the history, and cleared from the popup when the clone
-  ends. Only the username (never the password) is remembered, per server. A password or token you put in a link is taken out of it by the
+  ends. Nothing is saved unless you switch on "Remember this login": then the username (never the password) is kept per server, and the login goes to your git credential helper. A token that is the whole login is never saved or shown as a username. A password or token you put in a link is taken out of it by the
   backend before anything else sees the link (the panel sends links on stdin), and travels the same private way, so it is
   never in the field, on a command line or in the repository's remote, even when you run `omaclone` yourself. A login is
   given only to the exact origin it was typed for, and an SSH key passphrase is kept apart from passwords, with its own helper.
