@@ -65,6 +65,13 @@ class PanelSafety(unittest.TestCase):
         self.assertIn("tokenAsUser: !isSsh && signinTokenAsUser && signinUser.trim() === \"\"", SRC)
         self.assertNotIn("signinUser = p.login.password", SRC)
 
+    def test_a_web_login_is_bound_to_an_origin_for_every_web_link(self):
+        # Azure DevOps links have no SSH alternative; the origin must not depend on that
+        self.assertIn('loginOrigin: (urlOk && canSignIn) ? (parsed.webOrigin || "") : ""', SRC)
+        # an empty origin never counts as a bound login
+        self.assertIn('loginBound: loginOrigin !== "" && signinOrigin === loginOrigin', SRC)
+        self.assertIn("(loginBound && (", SRC)
+
     def test_the_panel_has_no_parser_of_its_own(self):
         self.assertNotIn("splitSecret", SRC)
         self.assertNotRegex(SRC, r"/\(https\?")                          # no hand-written link regular expression

@@ -81,8 +81,10 @@ Panel {
   readonly property bool askLogin: canSignIn || isSsh
   readonly property bool authNeeded: askLogin && checkResult !== null && checkResult.status === "auth"
   readonly property bool signinVisible: askLogin && (signinOpen || authNeeded) && phase !== "cloning" && phase !== "done"
-  readonly property string loginOrigin: (urlOk && !isSsh && canChoose) ? parsed.webOrigin : ""
-  readonly property bool hasLogin: isSsh ? keyPass !== "" : (signinUser.trim() !== "" || signinPass !== "")
+  readonly property string loginOrigin: (urlOk && canSignIn) ? (parsed.webOrigin || "") : ""     // every web link has one, Azure DevOps included
+  // A web login counts only while it is bound to the origin being cloned (an empty origin never matches: fail closed).
+  readonly property bool loginBound: loginOrigin !== "" && signinOrigin === loginOrigin
+  readonly property bool hasLogin: isSsh ? keyPass !== "" : (loginBound && (signinUser.trim() !== "" || signinPass !== ""))
   readonly property string loginJson: JSON.stringify({ user: isSsh ? "" : signinUser.trim(), password: isSsh ? keyPass : signinPass, remember: !isSsh && signinRemember && credHelper,
                                                                 tokenAsUser: !isSsh && signinTokenAsUser && signinUser.trim() === "" })
 

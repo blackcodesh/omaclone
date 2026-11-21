@@ -902,6 +902,19 @@ class SignIn(Env):
         self.assertNotIn("tok", q["display"])
 
 
+class LegacyUsers(Env):
+    def test_a_users_file_from_before_1_0_3_is_not_used_and_is_removed(self):
+        d = os.path.join(self.home, "state", "omaclone")
+        os.makedirs(d)
+        legacy = os.path.join(d, "users.json")
+        with open(legacy, "w") as f:
+            json.dump({"git.example.org": "ghp_SECRETTOKEN0123456789"}, f)
+        out = self.run_tool("state")[1][0]
+        self.assertEqual(out["users"], {})
+        self.assertFalse(os.path.exists(legacy))
+        self.assertNotIn("ghp_SECRET", json.dumps(out))
+
+
 class Protocols(unittest.TestCase):
     def test_an_https_link_also_offers_ssh(self):
         p = M.parse("https://codeberg.org/o/r/src/branch/dev")

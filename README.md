@@ -8,6 +8,11 @@ Bitbucket, SourceHut and any other git server**, because underneath it is plain 
 
 **Compatibility:** works with Omarchy 4.5 (checked on 4.5.0-3: manifest validation, the plugin's own tests, a live run on a 4.5 bar, and real clones from GitHub and Codeberg).
 
+## What's new in 1.0.4
+
+- A typed login is bound to its origin for every web link, Azure DevOps included (these have no SSH form, so they used to skip the binding). A login that is not bound to the link being cloned is never used.
+- Saved usernames from versions before 1.0.3 are discarded once: a token could have been saved there. Usernames are saved again only when you switch on "Remember this login".
+
 ## What's new in 1.0.3
 
 More credential fixes from the marketplace review:

@@ -458,10 +458,20 @@ def save_history(items):
 
 
 def users_file():
-    return os.path.join(state_dir(), "users.json")
+    return os.path.join(state_dir(), "users-v2.json")
+
+
+def drop_legacy_users():
+    """Before 1.0.3 a signed-in clone saved its username without being asked, and a token used as the whole login could end
+    up there. That file cannot be trusted, so it is removed once; names are remembered again (only on request) from then on."""
+    try:
+        os.unlink(os.path.join(state_dir(), "users.json"))
+    except OSError:
+        pass
 
 
 def load_users():
+    drop_legacy_users()
     try:
         with open(users_file()) as f:
             data = json.load(f)
